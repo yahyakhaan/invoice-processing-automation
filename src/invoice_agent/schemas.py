@@ -9,6 +9,31 @@ Decision = Literal["approve", "reject", "escalate"]
 CritiqueVerdict = Literal["accept", "revise"]
 FlagSeverity = Literal["blocking", "warning", "info"]
 
+BLOCKING_FLAGS = {
+    "MISSING_REQUIRED_FIELD",
+    "DATA_INTEGRITY",
+    "UNKNOWN_ITEM",
+    "ZERO_STOCK",
+    "OVER_STOCK",
+    "TOTAL_MISMATCH",
+    "DUPLICATE",
+    "VALIDATION_INCOMPLETE",
+    "INGEST_FAILED",
+    "UNSUPPORTED_EXTRACTION",
+    "PAYMENT_FAILED",
+}
+
+MANDATORY_VALIDATION_TOOLS = {
+    "check_required_fields",
+    "check_integrity",
+    "lookup_inventory",
+    "check_stock",
+    "reconcile_totals",
+    "check_duplicate",
+    "scan_fraud_signals",
+}
+
+
 class LineItem(BaseModel):
     sku: str
     raw_name: str
