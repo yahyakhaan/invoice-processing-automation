@@ -96,3 +96,99 @@ class InvoicePipeline:
         if state.get("invoice") and state.get("skip_ingest"):
             return "normalize"
         return "ingest"
+
+    def ingest_node(self, state: GraphState) -> dict[str, Any]:
+        retry = int(state.get("ingest_retry_count") or 0)
+        try:
+            result = self.ingestion.invoke(
+                {
+                    "path": state.get("raw_path"),
+                    "raw_text": state.get("raw_text"),
+                    "retry_errors": state.get("fatal_error"),
+                    "attempt": retry,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "fatal_error": "INGEST_ERROR",
+                "ingest_retry_count": retry + 1,
+                "events": [
+                    event(
+                        run_id=state["run_id"],
+                        node="ingest",
+                        agent_id="ingestion",
+                        event_name="INGEST_ERROR",
+                        level="ERROR",
+                        data={"error": str(exc), "path": state.get("raw_path")},
+                    )
+                ],
+            }
+        draft = InvoiceDraft.model_validate(result.output)
+        missing = []
+        if not (draft.vendor_raw or "").strip():
+            missing.append("vendor")
+        if not draft.invoice_number:
+            missing.append("invoice_number")
+        if not draft.line_items:
+            missing.append("line_items")
+        events = [
+            event(
+                run_id=state["run_id"],
+                invoice_id=draft.invoice_number,
+                agent_id="ingestion",
+                node="ingest",
+                event_name="INGEST_COMPLETE",
+                data={"missing": missing, "attempt": retry, "format": draft.source_format},
+            ),
+            handoff(
+                run_id=state["run_id"],
+                invoice_id=draft.invoice_number,
+                source="ingestion",
+                target="normalize" if retry >= 2 or not missing else "ingestion",
+            ),
+        ]
+        return {
+            "invoice_draft": draft.model_dump(),
+            "raw_text": draft.raw_text or state.get("raw_text"),
+            "ingest_retry_count": retry + (1 if missing else 0),
+            "fatal_error": None if draft.line_items or draft.invoice_number else "INGEST_FAILED",
+            "tool_trace": _annotate_trace("ingestion", result.tool_trace),
+            "agent_messages": result.messages,
+            "events": events,
+            "model_calls": int(state.get("model_calls") or 0) + result.model_calls,
+        }
+
+    def route_after_ingest(self, state: GraphState) -> str:
+        if state.get("fatal_error") in {"INGEST_ERROR", "INGEST_FAILED"} and int(state.get("ingest_retry_count") or 0) >= 2:
+            return "reject"
+        draft = state.get("invoice_draft") or {}
+        missing = not draft.get("line_items") and not draft.get("invoice_number")
+        if missing and int(state.get("ingest_retry_count") or 0) < 2:
+            return "ingest"
+        if missing and int(state.get("ingest_retry_count") or 0) >= 2:
+            return "reject"
+        if not draft.get("line_items") and int(state.get("ingest_retry_count") or 0) < 2:
+            return "ingest"
+        return "normalize"
+
+    def normalize_node(self, state: GraphState) -> dict[str, Any]:
+        if state.get("invoice") and state.get("skip_ingest") and not state.get("invoice_draft"):
+            invoice = Invoice.model_validate(state["invoice"])
+            flags = []
+        else:
+            draft = InvoiceDraft.model_validate(state["invoice_draft"])
+            invoice = normalize_draft(draft)
+            flags = [f.model_dump() for f in identity_flags(invoice, draft)]
+        return {
+            "invoice": invoice.model_dump(),
+            "extra_flags": flags,
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=invoice.invoice_number,
+                    node="normalize",
+                    event_name="NORMALIZED",
+                    data={"sku": [i.sku for i in invoice.line_items]},
+                )
+            ],
+        }
