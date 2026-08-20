@@ -367,3 +367,56 @@ class InvoicePipeline:
         if action == "pending":
             return "human"
         return "reject"
+
+    def human_review_node(self, state: GraphState) -> dict[str, Any]:
+        invoice = state.get("invoice") or {}
+        payload = interrupt(
+            {
+                "type": "vp_review",
+                "invoice_number": invoice.get("invoice_number"),
+                "vendor": invoice.get("vendor_canonical"),
+                "total": invoice.get("total"),
+                "currency": invoice.get("currency"),
+                "usd_equivalent": (state.get("validation") or {}).get("usd_equivalent"),
+                "rationale": (state.get("approval_final") or {}).get("rationale"),
+                "thread_id": state.get("thread_id"),
+            }
+        )
+        decision = payload.get("decision") if isinstance(payload, dict) else payload
+        actor = payload.get("actor", "VP") if isinstance(payload, dict) else "VP"
+        rationale = payload.get("rationale", "") if isinstance(payload, dict) else ""
+        conn = storage.connect(Path(self.settings.inventory_db))
+        try:
+            storage.record_human_decision(
+                conn,
+                thread_id=state["thread_id"],
+                decision=str(decision),
+                actor=str(actor),
+                rationale=str(rationale),
+            )
+        finally:
+            conn.close()
+        return {
+            "human_review": {
+                "decision": decision,
+                "actor": actor,
+                "rationale": rationale,
+            },
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=invoice.get("invoice_number"),
+                    node="human_review",
+                    event_name="VP_DECISION",
+                    data={"decision": decision, "actor": actor},
+                )
+            ],
+        }
+
+    def route_after_human(self, state: GraphState) -> str:
+        report = ValidationReport.model_validate(state["validation"])
+        if report.has_blocking:
+            return "reject"
+        if (state.get("human_review") or {}).get("decision") == "approve":
+            return "pay"
+        return "reject"
