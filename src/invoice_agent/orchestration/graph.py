@@ -290,3 +290,80 @@ class InvoicePipeline:
             ],
             "model_calls": int(state.get("model_calls") or 0) + result.model_calls,
         }
+
+    def critique_node(self, state: GraphState) -> dict[str, Any]:
+        draft = state.get("approval_final") or state.get("approval_draft")
+        result = self.critic.invoke(
+            {
+                "approval_draft": draft,
+                "validation": state["validation"],
+            }
+        )
+        bump = 1 if result.output.get("verdict") == "revise" else 0
+        return {
+            "approval_critique": result.output,
+            "approval_revision_count": int(state.get("approval_revision_count") or 0) + bump,
+            "tool_trace": _annotate_trace("critic", result.tool_trace),
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=(state.get("invoice") or {}).get("invoice_number"),
+                    agent_id="critic",
+                    node="critique",
+                    event_name="CRITIQUE",
+                    data={"verdict": result.output.get("verdict")},
+                ),
+                handoff(
+                    run_id=state["run_id"],
+                    invoice_id=(state.get("invoice") or {}).get("invoice_number"),
+                    source="critic",
+                    target="approval" if result.output.get("verdict") == "revise" else "gate",
+                ),
+            ],
+            "model_calls": int(state.get("model_calls") or 0) + result.model_calls,
+        }
+
+    def route_after_critique(self, state: GraphState) -> str:
+        critique = state.get("approval_critique") or {}
+        if critique.get("verdict") == "revise" and int(state.get("approval_revision_count") or 0) <= 1:
+            return "approve"
+        return "gate"
+
+    def gate_node(self, state: GraphState) -> dict[str, Any]:
+        revision = int(state.get("approval_revision_count") or 0)
+        critique = state.get("approval_critique") or {}
+        bump = 1 if critique.get("verdict") == "revise" and revision < 1 else 0
+        final = state.get("approval_final") or state.get("approval_draft")
+        return {
+            "approval_final": final,
+            "approval_revision_count": revision + bump,
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=(state.get("invoice") or {}).get("invoice_number"),
+                    node="gate",
+                    event_name="PAYMENT_GATE",
+                    data={"decision": (final or {}).get("decision")},
+                )
+            ],
+        }
+
+    def route_gate(self, state: GraphState) -> str:
+        report = ValidationReport.model_validate(state["validation"])
+        final = state.get("approval_final") or {}
+        human = state.get("human_review")
+        usd = report.usd_equivalent or 0
+        high = usd > self.settings.high_value_usd
+        fraud = "FRAUD_LANGUAGE" in report.codes()
+        action = payment_eligible(
+            blocking=report.has_blocking,
+            final_decision=final.get("decision"),
+            human_decision=(human or {}).get("decision"),
+            high_value=high,
+            fraud=fraud,
+        )
+        if action == "pay":
+            return "pay"
+        if action == "pending":
+            return "human"
+        return "reject"
