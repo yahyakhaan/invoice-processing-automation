@@ -192,3 +192,101 @@ class InvoicePipeline:
                 )
             ],
         }
+
+    def validate_node(self, state: GraphState) -> dict[str, Any]:
+        retry = int(state.get("validation_retry_count") or 0)
+        result = self.validation.invoke(
+            {
+                "invoice": state["invoice"],
+                "source_path": state.get("raw_path") or "",
+                "raw_text": state.get("raw_text") or "",
+                "extra_flags": state.get("extra_flags") or [],
+                "skip_tools": state.get("skip_tools") if retry == 0 else [],
+            }
+        )
+        report = ValidationReport.model_validate(result.output)
+        missing = validation_tool_guard(report.tools_called)
+        if missing and retry < 1:
+            return {
+                "validation_retry_count": retry + 1,
+                "tool_trace": _annotate_trace("validation", result.tool_trace),
+                "events": [
+                    event(
+                        run_id=state["run_id"],
+                        invoice_id=(state.get("invoice") or {}).get("invoice_number"),
+                        agent_id="validation",
+                        event_name="VALIDATION_RETRY",
+                        data={"missing": missing},
+                    )
+                ],
+            }
+        report = apply_guard(report)
+        return {
+            "validation": report.model_dump(),
+            "validation_retry_count": retry,
+            "tool_trace": _annotate_trace("validation", result.tool_trace),
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=(state.get("invoice") or {}).get("invoice_number"),
+                    agent_id="validation",
+                    node="validate",
+                    event_name="VALIDATED",
+                    data={"flags": [f.code for f in report.flags], "missing_tools": missing},
+                ),
+                handoff(
+                    run_id=state["run_id"],
+                    invoice_id=(state.get("invoice") or {}).get("invoice_number"),
+                    source="validation",
+                    target="approval",
+                ),
+            ],
+            "model_calls": int(state.get("model_calls") or 0) + result.model_calls,
+        }
+
+    def route_after_validate(self, state: GraphState) -> str:
+        report = state.get("validation")
+        if report is None:
+            return "validate"
+        codes = {f["code"] for f in (report.get("flags") or [])}
+        if "VALIDATION_INCOMPLETE" in codes and int(state.get("validation_retry_count") or 0) < 1:
+            return "validate"
+        if "DEDUP" in codes:
+            return "reject"
+        return "approve"
+
+    def approve_node(self, state: GraphState) -> dict[str, Any]:
+        result = self.approval.invoke(
+            {
+                "invoice": state["invoice"],
+                "validation": state["validation"],
+                "critique": state.get("approval_critique"),
+            }
+        )
+        data = result.output
+        fx_flags = (data.get("_fx") or {}).get("flags") or []
+        usd = data.get("_usd")
+        validation = dict(state["validation"])
+        flags = list(validation.get("flags") or [])
+        for flag in fx_flags:
+            if isinstance(flag, dict) and not any(existing.get("code") == flag.get("code") for existing in flags):
+                flags.append(flag)
+        validation["flags"] = flags
+        validation["usd_equivalent"] = usd
+        key = "approval_final" if state.get("approval_critique") else "approval_draft"
+        return {
+            key: {k: v for k, v in data.items() if not k.startswith("_")},
+            "validation": validation,
+            "tool_trace": _annotate_trace("approval", result.tool_trace),
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=(state.get("invoice") or {}).get("invoice_number"),
+                    agent_id="approval",
+                    node="approve",
+                    event_name="APPROVAL_DRAFT" if key == "approval_draft" else "APPROVAL_FINAL",
+                    data={"decision": data.get("decision")},
+                )
+            ],
+            "model_calls": int(state.get("model_calls") or 0) + result.model_calls,
+        }
