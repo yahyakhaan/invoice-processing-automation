@@ -420,3 +420,111 @@ class InvoicePipeline:
         if (state.get("human_review") or {}).get("decision") == "approve":
             return "pay"
         return "reject"
+
+    def pay_node(self, state: GraphState) -> dict[str, Any]:
+        invoice = Invoice.model_validate(state["invoice"])
+        amount = invoice.total if invoice.total is not None else 0.0
+        paid = execute_payment(
+            vendor=invoice.vendor_canonical,
+            amount=amount,
+            invoice_number=invoice.invoice_number,
+            revision=invoice.revision,
+            settings=self.settings,
+        )
+        outcome = "PAY" if paid["status"] == "success" else "PAYMENT_FAILED"
+        return {
+            "payment": paid,
+            "outcome": outcome,
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=invoice.invoice_number,
+                    node="pay",
+                    event_name=outcome,
+                    data={"amount": amount, "vendor": invoice.vendor_canonical},
+                )
+            ],
+        }
+
+    def reject_node(self, state: GraphState) -> dict[str, Any]:
+        report = ValidationReport.model_validate(state["validation"]) if state.get("validation") else None
+        codes = report.codes() if report else set()
+        if "DEDUP" in codes:
+            outcome = "DEDUP"
+        elif state.get("fatal_error") == "INGEST_FAILED":
+            outcome = "INGEST_FAILED"
+        else:
+            outcome = "REJECT"
+        invoice_id = (state.get("invoice") or state.get("invoice_draft") or {}).get("invoice_number")
+        return {
+            "outcome": outcome,
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=invoice_id,
+                    node="reject",
+                    event_name=outcome,
+                    data={"flags": sorted(codes)},
+                )
+            ],
+        }
+
+    def report_node(self, state: GraphState) -> dict[str, Any]:
+        invoice = state.get("invoice") or {}
+        validation = state.get("validation") or {}
+        outcome = state.get("outcome") or "UNKNOWN"
+        conn = storage.connect(Path(self.settings.inventory_db))
+        try:
+            if invoice.get("invoice_number"):
+                storage.record_processed(
+                    conn,
+                    invoice_number=invoice["invoice_number"],
+                    revision=invoice.get("revision"),
+                    source_path=state.get("raw_path") or "",
+                    canonical_hash=validation.get("canonical_hash"),
+                    outcome=outcome,
+                    run_id=state["run_id"],
+                )
+        finally:
+            conn.close()
+        return {
+            "events": [
+                event(
+                    run_id=state["run_id"],
+                    invoice_id=invoice.get("invoice_number"),
+                    node="report",
+                    event_name="COMPLETE",
+                    data={"outcome": outcome},
+                )
+            ]
+        }
+
+    def run(self, *, thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        config = {"configurable": {"thread_id": thread_id}}
+        self.graph.invoke(payload, config)
+        return self.snapshot(thread_id)
+
+    def resume(self, *, thread_id: str, decision: str, actor: str, rationale: str) -> dict[str, Any]:
+        config = {"configurable": {"thread_id": thread_id}}
+        snap = self.snapshot(thread_id)
+        if snap.get("outcome") in {"PAY", "REJECT", "DEDUP", "INGEST_FAILED", "PAYMENT_FAILED"}:
+            return snap
+        self.graph.invoke(
+            Command(resume={"decision": decision, "actor": actor, "rationale": rationale}),
+            config,
+        )
+        return self.snapshot(thread_id)
+
+    def snapshot(self, thread_id: str) -> dict[str, Any]:
+        config = {"configurable": {"thread_id": thread_id}}
+        snap = self.graph.get_state(config)
+        values = dict(snap.values)
+        pending = bool(snap.next) and "human_review" in (snap.next or ())
+        if pending or (not values.get("outcome") and snap.tasks):
+            interrupts = []
+            for task in snap.tasks or []:
+                interrupts.extend([i.value for i in (task.interrupts or [])])
+            if interrupts or pending:
+                values["outcome"] = "PENDING_VP_REVIEW"
+                values["pending_interrupt"] = interrupts[0] if interrupts else {"type": "vp_review"}
+        return values
