@@ -54,6 +54,22 @@ def find_processed(conn: sqlite3.Connection, invoice_number: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def clear_processed_ledger(settings: Settings | None = None) -> dict[str, int]:
+    """Wipe processed invoice history so corpus demos are not short-circuited by DEDUP."""
+    settings = settings or get_settings()
+    ensure_database(settings)
+    conn = connect(Path(settings.inventory_db))
+    try:
+        processed = conn.execute("SELECT COUNT(*) FROM processed_invoices").fetchone()[0]
+        payments = conn.execute("SELECT COUNT(*) FROM payment_attempts").fetchone()[0]
+        conn.execute("DELETE FROM processed_invoices")
+        conn.execute("DELETE FROM payment_attempts")
+        conn.commit()
+        return {"processed_invoices": int(processed), "payment_attempts": int(payments)}
+    finally:
+        conn.close()
+
+
 def record_processed(
     conn: sqlite3.Connection,
     *,

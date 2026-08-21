@@ -10,8 +10,9 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from invoice_agent.config import get_settings
+from invoice_agent.observability.console import progress
 from invoice_agent.runner import process_demo, process_path, resume_review
-from invoice_agent.storage import ensure_database
+from invoice_agent.storage import clear_processed_ledger, ensure_database
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -20,6 +21,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", default="outputs")
     parser.add_argument("--provider", choices=["mock", "xai", "ollama", "openai", "anthropic"])
     parser.add_argument("--require-llm", action="store_true")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Clear processed-invoice ledger before run (avoids DEDUP on re-demos)",
+    )
     parser.add_argument("--demo", choices=["vp-review"])
     parser.add_argument("--resume")
     parser.add_argument("--vp-decision", choices=["approve", "reject"])
@@ -41,6 +47,12 @@ def main(argv: list[str] | None = None) -> int:
     if not output_dir.is_absolute():
         output_dir = ROOT / output_dir
     ensure_database(settings)
+    if args.fresh:
+        cleared = clear_processed_ledger(settings)
+        progress(
+            "ledger cleared",
+            detail=f"processed={cleared['processed_invoices']} payments={cleared['payment_attempts']}",
+        )
     if args.resume:
         if not args.vp_decision:
             print("error: --resume requires --vp-decision", file=sys.stderr)
