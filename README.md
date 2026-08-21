@@ -2,35 +2,84 @@
 
 Acme was leaking **$2M/year** to a 30% error rate and a 5 day AP cycle: messy PDFs, an inconsistent inventory database, VP email chains, and a brittle payment step. This project compresses that path to seconds with an auditable control plane: four specialized agents, deterministic financial gates, and a checkpointed VP review.
 
-## Quickstart
+System diagrams (architecture, orchestration graph, multi-agent collaboration) live under [`system_design/`](system_design/).
+
+## Setup (once)
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env   # optional: set XAI_API_KEY for live LLM runs
+```
+
+Database bootstrap is **idempotent**. `python db/init_db.py` is optional, the first run creates `db/inventory.db` if needed.
+
+## Commands
+
+Pick one path depending on what you want to see.
+
+### 1. Offline / no API key (deterministic)
+
+Runs the full pipeline with mock agents. Good first check that parsers and gates work.
+
+```bash
+# entire corpus
 python main.py --invoice_path=data/invoices
+
+# one interesting reject (fraud + zero stock)
+python main.py --fresh --invoice_path=data/invoices/invoice_1003.txt
+
+# one clean over stock reject
+python main.py --fresh --invoice_path=data/invoices/invoice_1002.txt
+```
+
+Zero key runs are labeled **DETERMINISTIC FALLBACK — NO LLM**. They still execute ingest → validate → approve → critique → payment gate.
+
+`--fresh` clears the processed invoice ledger first. Without it, re-running the same invoice number usually returns **`DEDUP`**.
+
+### 2. Live LLM (agentic)
+
+Needs `XAI_API_KEY` in `.env` (or another supported provider).
+
+```bash
+# messy OCR style pay path (best single invoice LLM demo)
+python main.py --fresh --invoice_path=data/invoices/invoice_1012.txt --provider=xai --require-llm
+
+# fraud / stock reject with live agents
+python main.py --fresh --invoice_path=data/invoices/invoice_1003.txt --provider=xai --require-llm
+```
+
+`--require-llm` fails fast instead of silently falling back to mock.
+
+### 3. VP review (human-in-the-loop)
+
+Corpus invoices never hit a clean ≥ $10k approve path, so use the seeded demo:
+
+```bash
 python main.py --demo=vp-review
-# copy one of the printed --resume commands, for example:
+# with LLM on the middle stages:
+python main.py --demo=vp-review --provider=xai --require-llm
+```
+
+When it pauses, copy a printed resume command, for example:
+
+```bash
 python main.py --resume=<thread_id> --vp-decision=approve --vp-actor="VP Demo" --vp-reason="Within policy after review"
 ```
 
-Database bootstrap is **idempotent**. `python db/init_db.py` is optional.
-
-Zero key runs are labeled **DETERMINISTIC FALLBACK — NO LLM**. They still execute the four stage workflow, parsers, SQLite checks, and payment gate.
-
-### Live LLM (agentic demonstration)
-
-```bash
-cp .env.example .env   # set XAI_API_KEY
-python main.py --invoice_path=data/invoices/invoice_1012.txt --provider=xai --require-llm
-```
-
-`--require-llm` fails fast if the process would silently fall back to mock.
-
-Streamlit inspector (optional):
+### 4. Streamlit inspector (optional)
 
 ```bash
 streamlit run ui/app.py
+```
+
+Browse past runs, timelines, and the local VP queue.
+
+### 5. Tests
+
+```bash
+pytest -q
 ```
 
 ## What I did
@@ -83,23 +132,9 @@ Inventory is **read only** during a run so batch order cannot drain stock.
 - Payment idempotency keys; resume cannot double pay
 - Humans cannot override blocking validation facts
 
-## Run modes
-
-| Mode | Command | What it proves |
-|---|---|---|
-| Functional / offline | `python main.py --invoice_path=data/invoices` | Parsers + gates on the full corpus |
-| HITL | `python main.py --demo=vp-review` then `--resume` | Escalation that the corpus cannot reach |
-| Agentic | `--provider=xai --require-llm` | Live tool using agents |
-
 ## Observability
 
-Each run writes `outputs/<run_id>/<stem>/result.json` and `events.jsonl` with `agent_id`, handoffs, tools, and outcomes. The Rich CLI prints a one screen tree. Streamlit shows the same timeline plus a local VP queue.
-
-## Tests
-
-```bash
-pytest -q
-```
+Each run writes `outputs/<run_id>/<stem>/result.json` and `events.jsonl` with `agent_id`, handoffs, tools, and outcomes. The Rich CLI prints live stage lines plus a one-screen result tree. Streamlit shows the same timeline plus a local VP queue.
 
 ## What I cut
 
