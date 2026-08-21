@@ -16,6 +16,7 @@ from invoice_agent.agents.critic import ApprovalCriticAgent
 from invoice_agent.agents.ingestion import DocumentIngestionAgent
 from invoice_agent.agents.validation import ValidationAgent
 from invoice_agent.config import Settings
+from invoice_agent.observability.console import progress
 from invoice_agent.observability.logging import event
 from invoice_agent.orchestration.guards import apply_guard, payment_eligible, validation_tool_guard
 from invoice_agent.orchestration.handoffs import handoff
@@ -99,6 +100,10 @@ class InvoicePipeline:
 
     def ingest_node(self, state: GraphState) -> dict[str, Any]:
         retry = int(state.get("ingest_retry_count") or 0)
+        progress(
+            "stage: ingest",
+            detail=f"attempt={retry + 1} path={Path(state.get('raw_path') or '').name or 'inline'}",
+        )
         try:
             result = self.ingestion.invoke(
                 {
@@ -131,6 +136,10 @@ class InvoicePipeline:
             missing.append("invoice_number")
         if not draft.line_items:
             missing.append("line_items")
+        progress(
+            "stage: ingest complete",
+            detail=f"invoice={draft.invoice_number or '?'} items={len(draft.line_items)} missing={missing or 'none'}",
+        )
         events = [
             event(
                 run_id=state["run_id"],
@@ -172,6 +181,7 @@ class InvoicePipeline:
         return "normalize"
 
     def normalize_node(self, state: GraphState) -> dict[str, Any]:
+        progress("stage: normalize")
         if state.get("invoice") and state.get("skip_ingest") and not state.get("invoice_draft"):
             invoice = Invoice.model_validate(state["invoice"])
             flags = []
@@ -179,6 +189,10 @@ class InvoicePipeline:
             draft = InvoiceDraft.model_validate(state["invoice_draft"])
             invoice = normalize_draft(draft)
             flags = [f.model_dump() for f in identity_flags(invoice, draft)]
+        progress(
+            "stage: normalize complete",
+            detail=f"vendor={invoice.vendor_canonical} skus={[i.sku for i in invoice.line_items]}",
+        )
         return {
             "invoice": invoice.model_dump(),
             "extra_flags": flags,
@@ -195,6 +209,7 @@ class InvoicePipeline:
 
     def validate_node(self, state: GraphState) -> dict[str, Any]:
         retry = int(state.get("validation_retry_count") or 0)
+        progress("stage: validate", detail=f"attempt={retry + 1}")
         result = self.validation.invoke(
             {
                 "invoice": state["invoice"],
@@ -221,6 +236,10 @@ class InvoicePipeline:
                 ],
             }
         report = apply_guard(report)
+        progress(
+            "stage: validate complete",
+            detail=f"flags={[f.code for f in report.flags] or ['none']}",
+        )
         return {
             "validation": report.model_dump(),
             "validation_retry_count": retry,
@@ -256,6 +275,7 @@ class InvoicePipeline:
         return "approve"
 
     def approve_node(self, state: GraphState) -> dict[str, Any]:
+        progress("stage: approve")
         result = self.approval.invoke(
             {
                 "invoice": state["invoice"],
@@ -274,6 +294,7 @@ class InvoicePipeline:
         validation["flags"] = flags
         validation["usd_equivalent"] = usd
         key = "approval_final" if state.get("approval_critique") else "approval_draft"
+        progress("stage: approve complete", detail=f"decision={data.get('decision')}")
         return {
             key: {k: v for k, v in data.items() if not k.startswith("_")},
             "validation": validation,
@@ -293,6 +314,7 @@ class InvoicePipeline:
 
     def critique_node(self, state: GraphState) -> dict[str, Any]:
         draft = state.get("approval_final") or state.get("approval_draft")
+        progress("stage: critique")
         result = self.critic.invoke(
             {
                 "approval_draft": draft,
@@ -300,6 +322,7 @@ class InvoicePipeline:
             }
         )
         bump = 1 if result.output.get("verdict") == "revise" else 0
+        progress("stage: critique complete", detail=f"verdict={result.output.get('verdict')}")
         return {
             "approval_critique": result.output,
             "approval_revision_count": int(state.get("approval_revision_count") or 0) + bump,
@@ -334,6 +357,7 @@ class InvoicePipeline:
         critique = state.get("approval_critique") or {}
         bump = 1 if critique.get("verdict") == "revise" and revision < 1 else 0
         final = state.get("approval_final") or state.get("approval_draft")
+        progress("stage: payment gate", detail=f"decision={(final or {}).get('decision')}")
         return {
             "approval_final": final,
             "approval_revision_count": revision + bump,
@@ -362,6 +386,10 @@ class InvoicePipeline:
             high_value=high,
             fraud=fraud,
         )
+        progress(
+            "stage: gate route",
+            detail=f"action={action} usd={usd} high_value={high} fraud={fraud}",
+        )
         if action == "pay":
             return "pay"
         if action == "pending":
@@ -370,6 +398,10 @@ class InvoicePipeline:
 
     def human_review_node(self, state: GraphState) -> dict[str, Any]:
         invoice = state.get("invoice") or {}
+        progress(
+            "stage: VP interrupt",
+            detail=f"invoice={invoice.get('invoice_number')} total={invoice.get('total')}",
+        )
         payload = interrupt(
             {
                 "type": "vp_review",
@@ -424,6 +456,7 @@ class InvoicePipeline:
     def pay_node(self, state: GraphState) -> dict[str, Any]:
         invoice = Invoice.model_validate(state["invoice"])
         amount = invoice.total if invoice.total is not None else 0.0
+        progress("stage: pay", detail=f"{amount} → {invoice.vendor_canonical}")
         paid = execute_payment(
             vendor=invoice.vendor_canonical,
             amount=amount,
@@ -455,6 +488,7 @@ class InvoicePipeline:
             outcome = "INGEST_FAILED"
         else:
             outcome = "REJECT"
+        progress("stage: reject", detail=f"outcome={outcome} flags={sorted(codes)}")
         invoice_id = (state.get("invoice") or state.get("invoice_draft") or {}).get("invoice_number")
         return {
             "outcome": outcome,
@@ -473,6 +507,7 @@ class InvoicePipeline:
         invoice = state.get("invoice") or {}
         validation = state.get("validation") or {}
         outcome = state.get("outcome") or "UNKNOWN"
+        progress("stage: report", detail=f"outcome={outcome}")
         conn = storage.connect(Path(self.settings.inventory_db))
         try:
             if invoice.get("invoice_number"):

@@ -15,6 +15,15 @@ from invoice_agent.schemas import Invoice, PaymentResult, ValidationReport
 console = Console(stderr=True)
 
 
+def progress(message: str, *, detail: str | None = None) -> None:
+    """Live step line for demos — flush immediately so LLM waits are not silent."""
+    if detail:
+        console.print(f"[cyan]→[/cyan] {message}  [dim]{detail}[/dim]", highlight=False)
+    else:
+        console.print(f"[cyan]→[/cyan] {message}", highlight=False)
+    console.file.flush()
+
+
 def append_event(path: Path, event: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:

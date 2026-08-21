@@ -11,6 +11,7 @@ from langchain_core.tools import StructuredTool
 from invoice_agent.coerce import bind_payload, reset_payload
 from invoice_agent.config import Settings
 from invoice_agent.llm import get_chat_model
+from invoice_agent.observability.console import progress
 from invoice_agent.schemas import AgentResult
 
 
@@ -70,16 +71,28 @@ class SpecialistAgent(ABC):
         messages = [SystemMessage(content=self.system_prompt), HumanMessage(content=user)]
         trace: list[dict[str, Any]] = []
         calls = 0
-        for _ in range(self.max_iterations):
+        progress(
+            f"{self.agent_id}: starting LLM loop",
+            detail=f"tools={', '.join(self.tool_names) or 'none'}",
+        )
+        for iteration in range(self.max_iterations):
+            progress(
+                f"{self.agent_id}: waiting on model",
+                detail=f"iteration {iteration + 1}/{self.max_iterations}",
+            )
             response = llm.invoke(messages)
             calls += 1
             messages.append(response)
             tool_calls = getattr(response, "tool_calls", None) or []
+            content = (getattr(response, "content", None) or "").strip()
+            if content and not tool_calls:
+                progress(f"{self.agent_id}: model reply", detail=_clip_text(content, 160))
             if not tool_calls:
                 break
             for call in tool_calls:
                 name = call.get("name")
                 args = call.get("args") or {}
+                progress(f"{self.agent_id}: tool → {name}", detail=_tool_arg_summary(args))
                 tool = self.tool_map.get(name)
                 if tool is None:
                     result = json.dumps({"error": f"tool {name} not allowed"})
@@ -92,6 +105,7 @@ class SpecialistAgent(ABC):
                             result = tool.invoke({})
                         except Exception:
                             result = json.dumps({"error": str(exc), "tool": name})
+                progress(f"{self.agent_id}: tool ← {name}", detail=_clip_text(str(result), 120))
                 trace.append({"tool": name, "args": args, "result": _clip(result)})
                 messages.append(
                     ToolMessage(content=str(result), tool_call_id=call.get("id") or name)
@@ -99,6 +113,7 @@ class SpecialistAgent(ABC):
         structured = None
         if self.output_schema is not None:
             try:
+                progress(f"{self.agent_id}: structuring final output")
                 structured_llm = self.model.with_structured_output(self.output_schema)
                 structured = structured_llm.invoke(messages)
                 calls += 1
@@ -106,6 +121,7 @@ class SpecialistAgent(ABC):
                 structured = None
                 trace.append({"tool": "structured_output", "args": {}, "result": {"error": str(exc)}})
         output = self.finalize_llm(payload, trace, structured)
+        progress(f"{self.agent_id}: done", detail=f"model_calls={calls} tools={len(trace)}")
         dump = []
         for msg in messages:
             dump.append({"type": msg.__class__.__name__, "content": getattr(msg, "content", "")[:500]})
@@ -164,6 +180,27 @@ def _clip(result: Any, limit: int = 1500) -> Any:
         return json.loads(text)
     except Exception:
         return text
+
+
+def _clip_text(text: str, limit: int = 160) -> str:
+    text = " ".join(text.split())
+    if len(text) > limit:
+        return text[: limit - 1] + "…"
+    return text
+
+
+def _tool_arg_summary(args: dict[str, Any]) -> str:
+    keys = [k for k in args.keys() if k not in {"invoice_json", "validation_json", "approval_json"}]
+    if not keys:
+        return "payload args"
+    parts = []
+    for key in keys[:4]:
+        value = args.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            parts.append(f"{key}={value}")
+        else:
+            parts.append(key)
+    return ", ".join(parts)
 
 
 def fn_tool(name: str, description: str, func: Callable) -> StructuredTool:
