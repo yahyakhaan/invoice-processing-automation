@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections import defaultdict
-from pathlib import Path
 
 from invoice_agent import storage
 from invoice_agent.coerce import current_payload, parse_invoice
@@ -11,14 +9,16 @@ from invoice_agent.config import Settings
 from invoice_agent.schemas import Invoice, StockCheck, ValidationFlag
 
 
-def _settings(settings_json: str | None) -> Settings:
+def _settings(settings_json: str | None, settings: Settings | None = None) -> Settings:
+    if settings is not None:
+        return settings
     if settings_json:
         return Settings.model_validate_json(settings_json)
     return Settings()
 
 
-def _conn(settings: Settings) -> sqlite3.Connection:
-    return storage.connect(Path(settings.inventory_db))
+def _conn(settings: Settings) -> storage.StorageConnection:
+    return storage.connect(settings)
 
 
 def check_required_fields(invoice_json: str | None = None) -> str:
@@ -95,9 +95,11 @@ def check_integrity(invoice_json: str | None = None) -> str:
     return json.dumps({"flags": flags})
 
 
-def lookup_inventory(sku: str, settings_json: str | None = None) -> str:
-    settings = _settings(settings_json)
-    conn = _conn(settings)
+def lookup_inventory(
+    sku: str, settings_json: str | None = None, *, settings: Settings | None = None
+) -> str:
+    resolved = _settings(settings_json, settings)
+    conn = _conn(resolved)
     try:
         row = storage.lookup_item(conn, sku)
     finally:
@@ -114,11 +116,16 @@ def aggregate_quantities(invoice: Invoice) -> dict[str, float]:
     return dict(totals)
 
 
-def check_stock(invoice_json: str | None = None, settings_json: str | None = None) -> str:
+def check_stock(
+    invoice_json: str | None = None,
+    settings_json: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> str:
     inv = parse_invoice(invoice_json)
-    settings = _settings(settings_json)
+    resolved = _settings(settings_json, settings)
     aggregates = aggregate_quantities(inv)
-    conn = _conn(settings)
+    conn = _conn(resolved)
     flags = []
     checks = []
     try:
@@ -211,12 +218,14 @@ def check_duplicate(
     invoice_json: str | None = None,
     source_path: str = "",
     settings_json: str | None = None,
+    *,
+    settings: Settings | None = None,
 ) -> str:
     inv = parse_invoice(invoice_json)
     source_path = source_path or current_payload().get("source_path") or ""
-    settings = _settings(settings_json)
+    resolved = _settings(settings_json, settings)
     canonical_hash = invoice_hash(inv)
-    conn = _conn(settings)
+    conn = _conn(resolved)
     flags = []
     try:
         prior = storage.find_processed(conn, inv.invoice_number)

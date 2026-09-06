@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 
 from invoice_agent import storage
 from invoice_agent.config import Settings
@@ -28,17 +27,20 @@ def execute_payment(
     fail_once: bool = False,
 ) -> dict:
     key = payment_key(invoice_number, revision, vendor, amount)
-    conn = storage.connect(Path(settings.inventory_db))
+    conn = storage.connect(settings)
     try:
         existing = storage.get_payment_attempt(conn, key)
         if existing and existing.get("status") == "success":
+            response = existing["response"]
+            if isinstance(response, str):
+                response = json.loads(response)
             return {
                 "status": "success",
                 "idempotency_key": key,
                 "vendor": vendor,
                 "amount": amount,
                 "attempts": 1,
-                "response": json.loads(existing["response"]),
+                "response": response,
                 "replayed": True,
             }
         attempts = 0

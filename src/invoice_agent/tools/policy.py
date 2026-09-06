@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from invoice_agent import storage
 from invoice_agent.coerce import parse_invoice, parse_json_object, parse_validation
 from invoice_agent.config import Settings
-from invoice_agent.schemas import Invoice, ValidationReport
-
 
 POLICY_TEXT = """
 VP invoice policy:
@@ -19,13 +16,18 @@ VP invoice policy:
 """
 
 
-def convert_fx(invoice_json: str | None = None, settings_json: str | None = None) -> str:
+def convert_fx(
+    invoice_json: str | None = None,
+    settings_json: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> str:
     inv = parse_invoice(invoice_json)
-    settings = Settings.model_validate_json(settings_json) if settings_json else Settings()
+    resolved = settings or (Settings.model_validate_json(settings_json) if settings_json else Settings())
     amount = inv.total if inv.total is not None else inv.subtotal or 0.0
-    conn = storage.connect(Path(settings.inventory_db))
+    conn = storage.connect(resolved)
     try:
-        rate = storage.fx_rate(conn, inv.currency or "USD", settings.fx_eur_usd)
+        rate = storage.fx_rate(conn, inv.currency or "USD", resolved.fx_eur_usd)
     finally:
         conn.close()
     usd = amount * rate
@@ -57,20 +59,22 @@ def evaluate_approval_rules(
     invoice_json: str | None = None,
     validation_json: str | None = None,
     settings_json: str | None = None,
+    *,
+    settings: Settings | None = None,
 ) -> str:
     inv = parse_invoice(invoice_json)
     report = parse_validation(validation_json)
-    settings = Settings.model_validate_json(settings_json) if settings_json else Settings()
+    resolved = settings or (Settings.model_validate_json(settings_json) if settings_json else Settings())
     hits: list[str] = []
     usd = report.usd_equivalent
     if usd is None:
-        fx = json.loads(convert_fx(invoice_json, settings_json))
+        fx = json.loads(convert_fx(invoice_json, settings_json, settings=resolved))
         usd = fx["usd_equivalent"]
         from invoice_agent.schemas import ValidationFlag as _Flag
 
         report.flags.extend(_Flag.model_validate(f) for f in fx.get("flags") or [])
     blocking = [f.code for f in report.flags if f.severity == "blocking"]
-    if "HIGH_VALUE" not in hits and usd is not None and usd > settings.high_value_usd:
+    if "HIGH_VALUE" not in hits and usd is not None and usd > resolved.high_value_usd:
         hits.append("HIGH_VALUE")
     if any(f.code == "FRAUD_LANGUAGE" for f in report.flags):
         hits.append("FRAUD_LANGUAGE")
@@ -86,13 +90,13 @@ def evaluate_approval_rules(
                 "rationale": "Blocking validation flags forbid payment: " + ", ".join(blocking),
             }
         )
-    if usd is not None and usd > settings.high_value_usd:
+    if usd is not None and usd > resolved.high_value_usd:
         return json.dumps(
             {
                 "decision": "escalate",
                 "rule_hits": hits,
                 "usd_equivalent": usd,
-                "rationale": f"USD-equivalent ${usd:.2f} exceeds ${settings.high_value_usd:.0f} VP threshold",
+                "rationale": f"USD-equivalent ${usd:.2f} exceeds ${resolved.high_value_usd:.0f} VP threshold",
             }
         )
     if "FRAUD_LANGUAGE" in hits:
