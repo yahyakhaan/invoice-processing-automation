@@ -10,7 +10,7 @@ System diagrams (architecture, orchestration graph, multi-agent collaboration) l
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # optional: set XAI_API_KEY for live LLM runs
+cp .env.example .env   # optional: set GROQ_API_KEY for live LLM runs
 ```
 
 Database bootstrap is **idempotent**. `python db/init_db.py` is optional, the first run creates `db/inventory.db` if needed.
@@ -20,6 +20,9 @@ or 32-byte `LANGGRAPH_AES_KEY`, then run `python db/init_db.py`. Without
 `DATABASE_URL`, the existing local SQLite behavior is unchanged. See the
 [Phase 1 PostgreSQL guide](docs/deployment/phase-1-postgres.md) for migration and
 integration-test commands.
+
+The [Phase 2 FastAPI guide](docs/deployment/phase-2-fastapi.md) covers uploads,
+bundled samples, durable history, live progress, and VP review over HTTP.
 
 ## Commands
 
@@ -46,14 +49,14 @@ Zero key runs are labeled **DETERMINISTIC FALLBACK — NO LLM**. They still exec
 
 ### 2. Live LLM (agentic)
 
-Needs `XAI_API_KEY` in `.env` (or another supported provider).
+Needs `GROQ_API_KEY` in `.env` (or another supported provider).
 
 ```bash
 # messy OCR style pay path (best single invoice LLM demo)
-python main.py --fresh --invoice_path=data/invoices/invoice_1012.txt --provider=xai --require-llm
+python main.py --fresh --invoice_path=data/invoices/invoice_1012.txt --provider=groq --require-llm
 
 # fraud / stock reject with live agents
-python main.py --fresh --invoice_path=data/invoices/invoice_1003.txt --provider=xai --require-llm
+python main.py --fresh --invoice_path=data/invoices/invoice_1003.txt --provider=groq --require-llm
 ```
 
 `--require-llm` fails fast instead of silently falling back to mock.
@@ -65,7 +68,7 @@ Corpus invoices never hit a clean ≥ $10k approve path, so use the seeded demo:
 ```bash
 python main.py --demo=vp-review
 # with LLM on the middle stages:
-python main.py --demo=vp-review --provider=xai --require-llm
+python main.py --demo=vp-review --provider=groq --require-llm
 ```
 
 When it pauses, copy a printed resume command, for example:
@@ -87,6 +90,14 @@ Browse past runs, timelines, and the local VP queue.
 ```bash
 pytest -q
 ```
+
+### 6. FastAPI backend
+
+```bash
+PYTHONPATH=src uvicorn invoice_api.app:app --reload
+```
+
+Open `http://127.0.0.1:8000/docs` for the interactive API documentation.
 
 ## What I did
 

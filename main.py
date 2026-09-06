@@ -19,7 +19,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Multi-agent invoice processing")
     parser.add_argument("--invoice_path", help="Invoice file or directory")
     parser.add_argument("--output", default="outputs")
-    parser.add_argument("--provider", choices=["mock", "xai", "ollama", "openai", "anthropic"])
+    parser.add_argument(
+        "--provider",
+        choices=["mock", "groq", "xai", "ollama", "openai", "anthropic"],
+    )
     parser.add_argument("--require-llm", action="store_true")
     parser.add_argument(
         "--fresh",
@@ -41,7 +44,11 @@ def main(argv: list[str] | None = None) -> int:
         require_llm=args.require_llm,
     )
     if args.require_llm and settings.provider == "mock":
-        print("error: --require-llm needs XAI_API_KEY or --provider=xai|ollama|openai|anthropic", file=sys.stderr)
+        print(
+            "error: --require-llm needs a configured key or "
+            "--provider=groq|xai|ollama|openai|anthropic",
+            file=sys.stderr,
+        )
         return 2
     output_dir = Path(args.output)
     if not output_dir.is_absolute():
