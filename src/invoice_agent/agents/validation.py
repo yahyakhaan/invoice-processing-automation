@@ -4,10 +4,12 @@ import json
 from typing import Any
 
 from invoice_agent.agents.base import SpecialistAgent, fn_tool
-from invoice_agent.config import Settings
-from invoice_agent.schemas import Invoice, MANDATORY_VALIDATION_TOOLS, ValidationReport, ValidationSynthesis
+from invoice_agent.schemas import (
+    Invoice,
+    ValidationReport,
+    ValidationSynthesis,
+)
 from invoice_agent.tools import integrity
-
 
 VALIDATE_PROMPT = """You are ValidationAgent, a financial-control investigator.
 You must call every mandatory check tool: check_required_fields, check_integrity,
@@ -26,8 +28,6 @@ class ValidationAgent(SpecialistAgent):
     output_schema = ValidationSynthesis
 
     def build_tools(self):
-        settings_json = self.settings.model_dump_json()
-
         def check_required_fields(invoice_json: str) -> str:
             return integrity.check_required_fields(invoice_json)
 
@@ -35,16 +35,16 @@ class ValidationAgent(SpecialistAgent):
             return integrity.check_integrity(invoice_json)
 
         def lookup_inventory(sku: str) -> str:
-            return integrity.lookup_inventory(sku, settings_json)
+            return integrity.lookup_inventory(sku, settings=self.settings)
 
         def check_stock(invoice_json: str) -> str:
-            return integrity.check_stock(invoice_json, settings_json)
+            return integrity.check_stock(invoice_json, settings=self.settings)
 
         def reconcile_totals(invoice_json: str) -> str:
             return integrity.reconcile_totals(invoice_json, self.settings.total_tolerance)
 
         def check_duplicate(invoice_json: str, source_path: str = "") -> str:
-            return integrity.check_duplicate(invoice_json, source_path, settings_json)
+            return integrity.check_duplicate(invoice_json, source_path, settings=self.settings)
 
         def scan_fraud_signals(invoice_json: str, raw_text: str = "") -> str:
             return integrity.scan_fraud_signals(invoice_json, raw_text)
