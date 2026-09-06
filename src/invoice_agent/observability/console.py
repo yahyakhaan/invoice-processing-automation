@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -10,9 +13,18 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
-from invoice_agent.schemas import Invoice, PaymentResult, ValidationReport
-
 console = Console(stderr=True)
+ProgressSink = Callable[[str, str | None], None]
+_progress_sink: ContextVar[ProgressSink | None] = ContextVar("progress_sink", default=None)
+
+
+@contextmanager
+def capture_progress(sink: ProgressSink) -> Iterator[None]:
+    token = _progress_sink.set(sink)
+    try:
+        yield
+    finally:
+        _progress_sink.reset(token)
 
 
 def progress(message: str, *, detail: str | None = None) -> None:
@@ -22,6 +34,9 @@ def progress(message: str, *, detail: str | None = None) -> None:
     else:
         console.print(f"[cyan]→[/cyan] {message}", highlight=False)
     console.file.flush()
+    sink = _progress_sink.get()
+    if sink is not None:
+        sink(message, detail)
 
 
 def append_event(path: Path, event: dict[str, Any]) -> None:
@@ -72,4 +87,4 @@ def render_console(result: dict[str, Any]) -> None:
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
