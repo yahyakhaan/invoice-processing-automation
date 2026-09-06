@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from uuid import uuid4
 
 from invoice_agent.config import ROOT, Settings
-from invoice_agent.observability.console import render_console, write_result, append_event
+from invoice_agent.observability.console import (
+    append_event,
+    render_console,
+    write_result,
+)
 from invoice_agent.orchestration.graph import InvoicePipeline
 from invoice_agent.services.demo import hitl_demo_invoice
-from invoice_agent.storage import ensure_database
+from invoice_agent.storage import ensure_database, record_run_snapshot
 
 
 def collect_invoices(path: str) -> list[Path]:
@@ -65,6 +68,7 @@ def persist(values: dict, settings: Settings, output_root: Path, source: str | N
         events_path.unlink()
     for item in values.get("events") or []:
         append_event(events_path, item)
+    record_run_snapshot(settings, payload)
     return folder / "result.json"
 
 
@@ -83,16 +87,54 @@ def print_resume_help(thread_id: str) -> None:
 
 def process_path(settings: Settings, invoice_path: str, output_dir: Path) -> list[dict]:
     ensure_database(settings)
-    pipeline = InvoicePipeline(settings)
     results = []
-    run_id = uuid4().hex[:12]
-    for path in collect_invoices(invoice_path):
-        thread_id = f"{run_id}-{path.stem}-{path.suffix.lstrip('.')}"
+    run_id = str(uuid4())
+    with InvoicePipeline(settings) as pipeline:
+        for path in collect_invoices(invoice_path):
+            thread_id = str(uuid4())
+            values = pipeline.run(
+                thread_id=thread_id,
+                payload={
+                    "raw_path": str(path),
+                    "demo_mode": False,
+                    "events": [],
+                    "tool_trace": [],
+                    "agent_messages": [],
+                    "ingest_retry_count": 0,
+                    "validation_retry_count": 0,
+                    "approval_revision_count": 0,
+                    "agentic_mode": settings.agentic_mode,
+                    "run_id": run_id,
+                    "thread_id": thread_id,
+                    "provider": settings.provider,
+                    "model": settings.model_name,
+                    "model_calls": 0,
+                    "skip_ingest": False,
+                },
+            )
+            payload = result_payload(values, settings, str(path))
+            persist(values, settings, output_dir, str(path))
+            render_console(payload)
+            if payload.get("outcome") == "PENDING_VP_REVIEW":
+                print_resume_help(thread_id)
+            results.append(payload)
+    return results
+
+
+def process_demo(settings: Settings, output_dir: Path) -> dict:
+    ensure_database(settings)
+    run_id = str(uuid4())
+    thread_id = str(uuid4())
+    invoice = hitl_demo_invoice(thread_id)
+    with InvoicePipeline(settings) as pipeline:
         values = pipeline.run(
             thread_id=thread_id,
             payload={
-                "raw_path": str(path),
-                "demo_mode": False,
+                "raw_path": None,
+                "demo_mode": True,
+                "skip_ingest": True,
+                "invoice": invoice.model_dump(),
+                "invoice_draft": None,
                 "events": [],
                 "tool_trace": [],
                 "agent_messages": [],
@@ -105,46 +147,8 @@ def process_path(settings: Settings, invoice_path: str, output_dir: Path) -> lis
                 "provider": settings.provider,
                 "model": settings.model_name,
                 "model_calls": 0,
-                "skip_ingest": False,
             },
         )
-        payload = result_payload(values, settings, str(path))
-        persist(values, settings, output_dir, str(path))
-        render_console(payload)
-        if payload.get("outcome") == "PENDING_VP_REVIEW":
-            print_resume_help(thread_id)
-        results.append(payload)
-    return results
-
-
-def process_demo(settings: Settings, output_dir: Path) -> dict:
-    ensure_database(settings)
-    pipeline = InvoicePipeline(settings)
-    run_id = uuid4().hex[:12]
-    thread_id = f"demo-{run_id}"
-    invoice = hitl_demo_invoice(thread_id)
-    values = pipeline.run(
-        thread_id=thread_id,
-        payload={
-            "raw_path": None,
-            "demo_mode": True,
-            "skip_ingest": True,
-            "invoice": invoice.model_dump(),
-            "invoice_draft": None,
-            "events": [],
-            "tool_trace": [],
-            "agent_messages": [],
-            "ingest_retry_count": 0,
-            "validation_retry_count": 0,
-            "approval_revision_count": 0,
-            "agentic_mode": settings.agentic_mode,
-            "run_id": run_id,
-            "thread_id": thread_id,
-            "provider": settings.provider,
-            "model": settings.model_name,
-            "model_calls": 0,
-        },
-    )
     payload = result_payload(values, settings, "demo:vp-review")
     persist(values, settings, output_dir, "demo_vp_review")
     render_console(payload)
@@ -154,8 +158,8 @@ def process_demo(settings: Settings, output_dir: Path) -> dict:
 
 def resume_review(settings: Settings, thread_id: str, decision: str, actor: str, rationale: str, output_dir: Path) -> dict:
     ensure_database(settings)
-    pipeline = InvoicePipeline(settings)
-    values = pipeline.resume(thread_id=thread_id, decision=decision, actor=actor, rationale=rationale)
+    with InvoicePipeline(settings) as pipeline:
+        values = pipeline.resume(thread_id=thread_id, decision=decision, actor=actor, rationale=rationale)
     payload = result_payload(values, settings, values.get("raw_path"))
     persist(values, settings, output_dir, values.get("raw_path") or thread_id)
     render_console(payload)
