@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any
-from uuid import uuid4
+from types import TracebackType
+from typing import Any, Self
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.encrypted import EncryptedSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
@@ -18,8 +20,13 @@ from invoice_agent.agents.validation import ValidationAgent
 from invoice_agent.config import Settings
 from invoice_agent.observability.console import progress
 from invoice_agent.observability.logging import event
-from invoice_agent.orchestration.guards import apply_guard, payment_eligible, validation_tool_guard
+from invoice_agent.orchestration.guards import (
+    apply_guard,
+    payment_eligible,
+    validation_tool_guard,
+)
 from invoice_agent.orchestration.handoffs import handoff
+from invoice_agent.persistence.database import psycopg_database_url
 from invoice_agent.schemas import Invoice, InvoiceDraft, ValidationReport
 from invoice_agent.services.normalization import identity_flags, normalize_draft
 from invoice_agent.state import GraphState
@@ -33,17 +40,63 @@ def _annotate_trace(agent_id: str, trace: list[dict[str, Any]]) -> list[dict[str
 class InvoicePipeline:
     def __init__(self, settings: Settings, *, memory_checkpointer: bool = False):
         self.settings = settings
+        self._checkpoint_connection: Any | None = None
         storage.ensure_database(settings)
         self.ingestion = DocumentIngestionAgent(settings)
         self.validation = ValidationAgent(settings)
         self.approval = ApprovalAgent(settings)
         self.critic = ApprovalCriticAgent(settings)
-        if memory_checkpointer:
-            self.checkpointer = MemorySaver()
-        else:
+        backend = "memory" if memory_checkpointer else settings.resolved_checkpoint_backend
+        serializer = self._checkpoint_serializer(required=backend == "postgres")
+        if backend == "memory":
+            self.checkpointer = MemorySaver(serde=serializer)
+        elif backend == "sqlite":
             conn = sqlite3.connect(str(settings.checkpoint_db), check_same_thread=False)
-            self.checkpointer = SqliteSaver(conn)
+            self._checkpoint_connection = conn
+            self.checkpointer = SqliteSaver(conn, serde=serializer)
+        elif backend == "postgres":
+            from langgraph.checkpoint.postgres import PostgresSaver
+            from psycopg import Connection as PsycopgConnection
+            from psycopg.rows import dict_row
+
+            if not settings.database_url:
+                raise ValueError("DATABASE_URL is required for PostgreSQL checkpoints")
+            conn = PsycopgConnection.connect(
+                psycopg_database_url(settings.database_url),
+                autocommit=True,
+                prepare_threshold=0,
+                row_factory=dict_row,
+            )
+            self._checkpoint_connection = conn
+            self.checkpointer = PostgresSaver(conn, serde=serializer)
+            self.checkpointer.setup()
+        else:  # pragma: no cover - Settings validation prevents this branch.
+            raise ValueError(f"Unsupported checkpoint backend: {backend}")
         self.graph = self._build().compile(checkpointer=self.checkpointer)
+
+    def _checkpoint_serializer(self, *, required: bool) -> SerializerProtocol | None:
+        key = self.settings.langgraph_aes_key
+        if not key:
+            if required:
+                raise ValueError("LANGGRAPH_AES_KEY is required for PostgreSQL checkpoints")
+            return None
+        return EncryptedSerializer.from_pycryptodome_aes(key=key.encode("utf-8"))
+
+    def close(self) -> None:
+        if self._checkpoint_connection is not None:
+            self._checkpoint_connection.close()
+            self._checkpoint_connection = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
 
     def _build(self):
         graph = StateGraph(GraphState)
@@ -417,7 +470,7 @@ class InvoicePipeline:
         decision = payload.get("decision") if isinstance(payload, dict) else payload
         actor = payload.get("actor", "VP") if isinstance(payload, dict) else "VP"
         rationale = payload.get("rationale", "") if isinstance(payload, dict) else ""
-        conn = storage.connect(Path(self.settings.inventory_db))
+        conn = storage.connect(self.settings)
         try:
             storage.record_human_decision(
                 conn,
@@ -508,7 +561,7 @@ class InvoicePipeline:
         validation = state.get("validation") or {}
         outcome = state.get("outcome") or "UNKNOWN"
         progress("stage: report", detail=f"outcome={outcome}")
-        conn = storage.connect(Path(self.settings.inventory_db))
+        conn = storage.connect(self.settings)
         try:
             if invoice.get("invoice_number"):
                 storage.record_processed(
