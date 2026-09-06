@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, TypeAlias
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from sqlalchemy import Connection, delete, func, select, text
+from sqlalchemy import Connection, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.orm import Session
 
@@ -308,7 +308,12 @@ def _run_status(outcome: str | None) -> str:
     return "COMPLETED"
 
 
-def record_run_snapshot(settings: Settings, payload: dict[str, Any]) -> None:
+def record_run_snapshot(
+    settings: Settings,
+    payload: dict[str, Any],
+    *,
+    persist_events: bool = True,
+) -> None:
     """Persist the product-facing snapshot without exposing checkpoint internals."""
     if not settings.database_url:
         return
@@ -400,19 +405,18 @@ def record_run_snapshot(settings: Settings, payload: dict[str, Any]) -> None:
                 )
             )
 
-        session.execute(
-            delete(RunEvent).where(RunEvent.run_id == run_id, RunEvent.thread_id == thread_id)
-        )
-        for sequence, item in enumerate(payload.get("events") or [], start=1):
-            raw_timestamp = item.get("ts")
-            try:
-                occurred_at = datetime.fromisoformat(raw_timestamp) if raw_timestamp else datetime.now(UTC)
-            except ValueError:
-                occurred_at = datetime.now(UTC)
-            if occurred_at.tzinfo is None:
-                occurred_at = occurred_at.replace(tzinfo=UTC)
-            session.add(
-                RunEvent(
+        if persist_events:
+            for sequence, item in enumerate(payload.get("events") or [], start=1):
+                raw_timestamp = item.get("ts")
+                try:
+                    occurred_at = (
+                        datetime.fromisoformat(raw_timestamp) if raw_timestamp else datetime.now(UTC)
+                    )
+                except ValueError:
+                    occurred_at = datetime.now(UTC)
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=UTC)
+                event_statement = postgres_insert(RunEvent).values(
                     id=uuid5(NAMESPACE_URL, f"event:{run_id}:{thread_id}:{sequence}"),
                     run_id=run_id,
                     thread_id=thread_id,
@@ -423,7 +427,229 @@ def record_run_snapshot(settings: Settings, payload: dict[str, Any]) -> None:
                     level=item.get("level") or "INFO",
                     payload=_json_safe(item),
                 )
+                session.execute(
+                    event_statement.on_conflict_do_update(
+                        index_elements=["run_id", "thread_id", "sequence"],
+                        set_={
+                            "occurred_at": event_statement.excluded.occurred_at,
+                            "stage": event_statement.excluded.stage,
+                            "event_type": event_statement.excluded.event_type,
+                            "level": event_statement.excluded.level,
+                            "payload": event_statement.excluded.payload,
+                        },
+                    )
+                )
+
+
+def create_run_record(
+    settings: Settings,
+    *,
+    run_id: str,
+    thread_id: str,
+    source: str,
+) -> None:
+    """Create the durable shell returned by POST /api/runs before execution starts."""
+    if not settings.database_url:
+        return
+    run_uuid = _as_uuid(run_id)
+    thread_uuid = _as_uuid(thread_id)
+    initial_result = {
+        "run_id": str(run_uuid),
+        "thread_id": str(thread_uuid),
+        "source": source,
+        "status": "CREATED",
+        "outcome": None,
+    }
+    with Session(get_engine(settings.database_url)) as session, session.begin():
+        session.add(
+            Run(
+                id=run_uuid,
+                owner_id=settings.owner_id,
+                status="CREATED",
+                provider=settings.provider,
+                model=settings.model_name,
             )
+        )
+        session.flush()
+        session.add(
+            InvoiceRecord(
+                id=uuid5(NAMESPACE_URL, f"invoice:{thread_uuid}"),
+                run_id=run_uuid,
+                thread_id=thread_uuid,
+                source_path=source,
+                status="CREATED",
+                result_data=initial_result,
+            )
+        )
+
+
+def set_run_status(settings: Settings, run_id: str, status: str) -> None:
+    if not settings.database_url:
+        return
+    run_uuid = _as_uuid(run_id)
+    with Session(get_engine(settings.database_url)) as session, session.begin():
+        session.execute(
+            update(Run)
+            .where(Run.id == run_uuid, Run.owner_id == settings.owner_id)
+            .values(status=status, updated_at=func.now())
+        )
+        invoice_values: dict[str, Any] = {"status": status, "updated_at": func.now()}
+        if status == "RUNNING":
+            invoice_values["outcome"] = None
+        session.execute(
+            update(InvoiceRecord)
+            .where(InvoiceRecord.run_id == run_uuid)
+            .values(**invoice_values)
+        )
+
+
+def record_run_failure(settings: Settings, run_id: str, error: str) -> None:
+    if not settings.database_url:
+        return
+    run_uuid = _as_uuid(run_id)
+    with Session(get_engine(settings.database_url)) as session, session.begin():
+        invoice = session.execute(
+            select(InvoiceRecord).where(InvoiceRecord.run_id == run_uuid)
+        ).scalar_one_or_none()
+        if invoice is None:
+            return
+        result = dict(invoice.result_data or {})
+        result.update({"status": "FAILED", "outcome": None, "error": error})
+        invoice.result_data = result
+        invoice.status = "FAILED"
+        invoice.outcome = None
+
+
+def get_run_record(settings: Settings, run_id: str) -> dict[str, Any] | None:
+    if not settings.database_url:
+        return None
+    try:
+        run_uuid = _as_uuid(run_id)
+    except (TypeError, ValueError):
+        return None
+    with Session(get_engine(settings.database_url)) as session:
+        row = session.execute(
+            select(Run, InvoiceRecord)
+            .join(InvoiceRecord, InvoiceRecord.run_id == Run.id)
+            .where(Run.id == run_uuid, Run.owner_id == settings.owner_id)
+        ).first()
+        if row is None:
+            return None
+        run, invoice = row
+        result = dict(invoice.result_data or {})
+        result.update(
+            {
+                "run_id": str(run.id),
+                "thread_id": str(invoice.thread_id),
+                "status": run.status,
+                "outcome": invoice.outcome,
+                "source": invoice.source_path,
+                "provider": run.provider,
+                "model": run.model,
+                "created_at": run.created_at.isoformat(),
+                "updated_at": run.updated_at.isoformat(),
+            }
+        )
+        return result
+
+
+def list_run_records(
+    settings: Settings,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    if not settings.database_url:
+        return []
+    with Session(get_engine(settings.database_url)) as session:
+        rows = session.execute(
+            select(Run, InvoiceRecord)
+            .join(InvoiceRecord, InvoiceRecord.run_id == Run.id)
+            .where(Run.owner_id == settings.owner_id)
+            .order_by(Run.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        ).all()
+        records = []
+        for run, invoice in rows:
+            records.append(
+                {
+                    "run_id": str(run.id),
+                    "thread_id": str(invoice.thread_id),
+                    "status": run.status,
+                    "outcome": invoice.outcome,
+                    "invoice_id": invoice.invoice_number,
+                    "source": invoice.source_path,
+                    "provider": run.provider,
+                    "model": run.model,
+                    "created_at": run.created_at.isoformat(),
+                    "updated_at": run.updated_at.isoformat(),
+                }
+            )
+        return records
+
+
+def append_run_event(settings: Settings, event_payload: dict[str, Any]) -> None:
+    if not settings.database_url:
+        return
+    occurred_at = _parse_datetime(event_payload.get("timestamp"))
+    statement = postgres_insert(RunEvent).values(
+        id=_as_uuid(event_payload["event_id"]),
+        run_id=_as_uuid(event_payload["run_id"]),
+        thread_id=_as_uuid(event_payload["thread_id"]),
+        sequence=int(event_payload["sequence"]),
+        occurred_at=occurred_at,
+        stage=event_payload.get("stage"),
+        event_type=event_payload["event_type"],
+        level=event_payload.get("level") or "INFO",
+        payload=_json_safe(event_payload),
+    )
+    with get_engine(settings.database_url).begin() as conn:
+        conn.execute(
+            statement.on_conflict_do_update(
+                index_elements=["run_id", "thread_id", "sequence"],
+                set_={
+                    "occurred_at": statement.excluded.occurred_at,
+                    "stage": statement.excluded.stage,
+                    "event_type": statement.excluded.event_type,
+                    "level": statement.excluded.level,
+                    "payload": statement.excluded.payload,
+                },
+            )
+        )
+
+
+def list_run_events(
+    settings: Settings,
+    run_id: str,
+    *,
+    after_sequence: int = 0,
+) -> list[dict[str, Any]]:
+    if not settings.database_url:
+        return []
+    run_uuid = _as_uuid(run_id)
+    with Session(get_engine(settings.database_url)) as session:
+        rows = session.execute(
+            select(RunEvent.payload)
+            .join(Run, Run.id == RunEvent.run_id)
+            .where(
+                RunEvent.run_id == run_uuid,
+                RunEvent.sequence > after_sequence,
+                Run.owner_id == settings.owner_id,
+            )
+            .order_by(RunEvent.sequence)
+        ).scalars()
+        return [dict(item) for item in rows]
+
+
+def latest_run_event_sequence(settings: Settings, run_id: str) -> int:
+    if not settings.database_url:
+        return 0
+    with Session(get_engine(settings.database_url)) as session:
+        value = session.execute(
+            select(func.max(RunEvent.sequence)).where(RunEvent.run_id == _as_uuid(run_id))
+        ).scalar_one()
+        return int(value or 0)
 
 
 def list_run_snapshots(settings: Settings) -> list[dict[str, Any]]:
