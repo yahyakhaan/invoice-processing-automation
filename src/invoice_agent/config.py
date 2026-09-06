@@ -7,7 +7,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ROOT = Path(__file__).resolve().parents[2]
-Provider = Literal["mock", "xai", "ollama", "openai", "anthropic"]
+Provider = Literal["mock", "groq", "xai", "ollama", "openai", "anthropic"]
 CheckpointBackend = Literal["auto", "memory", "sqlite", "postgres"]
 
 
@@ -20,6 +20,8 @@ class Settings(BaseSettings):
 
     llm_provider: Provider | None = None
     llm_model: str | None = None
+    groq_api_key: str | None = Field(default=None, repr=False, exclude=True)
+    groq_model: str = "llama-3.3-70b-versatile"
     xai_api_key: str | None = Field(default=None, repr=False, exclude=True)
     xai_model: str = "grok-3"
     openai_api_key: str | None = Field(default=None, repr=False, exclude=True)
@@ -33,6 +35,8 @@ class Settings(BaseSettings):
     langgraph_aes_key: str | None = Field(default=None, repr=False, exclude=True)
     output_dir: Path = ROOT / "outputs"
     owner_id: str = "local"
+    max_upload_mb: int = Field(default=10, ge=1)
+    max_pdf_pages: int = Field(default=25, ge=1)
     high_value_usd: float = 10000.0
     fx_eur_usd: float = 1.08
     total_tolerance: float = 0.50
@@ -64,6 +68,8 @@ class Settings(BaseSettings):
             return self.provider_override
         if self.llm_provider:
             return self.llm_provider
+        if self.groq_api_key:
+            return "groq"
         if self.xai_api_key:
             return "xai"
         return "mock"
@@ -86,6 +92,8 @@ class Settings(BaseSettings):
     def model_name(self) -> str:
         if self.llm_model:
             return self.llm_model
+        if self.provider == "groq":
+            return self.groq_model
         if self.provider == "xai":
             return self.xai_model
         if self.provider == "ollama":
@@ -97,6 +105,8 @@ class Settings(BaseSettings):
         return "mock-deterministic"
 
     def resolved_api_key(self) -> str | None:
+        if self.provider == "groq":
+            return self.groq_api_key
         if self.provider == "xai":
             return self.xai_api_key
         if self.provider == "openai":

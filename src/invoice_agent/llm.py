@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from invoice_agent.config import Settings
@@ -27,6 +27,17 @@ def get_chat_model(settings: Settings):
         raise RuntimeError("--require-llm was set but no live LLM provider is configured")
     if settings.provider == "mock":
         return MockChatModel()
+    if settings.provider == "groq":
+        from langchain_openai import ChatOpenAI
+
+        if not settings.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY is required for provider=groq")
+        return ChatOpenAI(
+            model=settings.model_name,
+            api_key=settings.groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
+            temperature=0,
+        )
     if settings.provider == "xai":
         from langchain_openai import ChatOpenAI
 
