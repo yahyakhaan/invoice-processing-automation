@@ -7,6 +7,7 @@ from alembic import command
 from pydantic import ValidationError
 
 from invoice_agent.config import Settings
+from invoice_agent.llm import get_chat_model
 from invoice_agent.orchestration.graph import InvoicePipeline
 from invoice_agent.persistence.database import alembic_config
 from invoice_agent.persistence.models import Base
@@ -45,15 +46,33 @@ def test_secret_settings_are_excluded_from_repr_and_serialization() -> None:
     settings = Settings(
         database_url="postgresql://db-user:db-password@db.example/invoices",
         langgraph_aes_key="x" * 32,
+        groq_api_key="groq-secret",
         xai_api_key="xai-secret",
         openai_api_key="openai-secret",
         anthropic_api_key="anthropic-secret",
     )
     rendered = repr(settings)
     serialized = settings.model_dump_json()
-    for secret in ["db-password", "xai-secret", "openai-secret", "anthropic-secret", "x" * 32]:
+    for secret in [
+        "db-password",
+        "groq-secret",
+        "xai-secret",
+        "openai-secret",
+        "anthropic-secret",
+        "x" * 32,
+    ]:
         assert secret not in rendered
         assert secret not in serialized
+
+
+def test_groq_is_the_default_hosted_provider_when_configured() -> None:
+    settings = Settings(groq_api_key="test-groq-key", llm_provider=None)
+    assert settings.provider == "groq"
+    assert settings.model_name == "llama-3.3-70b-versatile"
+    assert settings.resolved_api_key() == "test-groq-key"
+    model = get_chat_model(settings)
+    assert model.model_name == "llama-3.3-70b-versatile"
+    assert str(model.openai_api_base) == "https://api.groq.com/openai/v1"
 
 
 def test_postgres_checkpointer_requires_encryption_key(monkeypatch) -> None:

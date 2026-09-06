@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import text
 
 from invoice_agent.config import Settings
@@ -18,8 +20,27 @@ from invoice_agent.storage import (
     record_payment_attempt,
     record_processed,
 )
+from invoice_api.app import create_app
 
 pytestmark = pytest.mark.postgres
+
+
+def _wait_for_api_status(
+    client: TestClient,
+    run_id: str,
+    expected: set[str],
+    *,
+    timeout: float = 8.0,
+) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/runs/{run_id}")
+        assert response.status_code == 200
+        payload = response.json()
+        if payload["status"] in expected:
+            return payload
+        time.sleep(0.05)
+    raise AssertionError(f"run {run_id} did not reach {sorted(expected)}")
 
 
 @pytest.fixture
@@ -155,3 +176,48 @@ def test_legacy_sqlite_data_migrates_to_postgres(postgres_settings, tmp_path) ->
             )
         ).scalar_one()
         assert response == {"status": "success"}
+
+
+def test_api_history_events_and_review_survive_app_restart(postgres_settings) -> None:
+    with TestClient(create_app(postgres_settings)) as client:
+        created_response = client.post("/api/runs", data={"sample_id": "demo:vp-review"})
+        assert created_response.status_code == 202
+        created = created_response.json()
+        pending = _wait_for_api_status(
+            client,
+            created["run_id"],
+            {"PENDING_REVIEW", "FAILED"},
+        )
+        assert pending["status"] == "PENDING_REVIEW"
+        first_events = client.get(created["events_url"]).json()["items"]
+        assert first_events[-1]["event_type"] == "RUN_PENDING_REVIEW"
+
+    # A fresh app has no in-memory run registry and must recover from PostgreSQL.
+    with TestClient(create_app(postgres_settings)) as restarted_client:
+        recovered = restarted_client.get(created["detail_url"])
+        assert recovered.status_code == 200
+        assert recovered.json()["status"] == "PENDING_REVIEW"
+        assert recovered.json()["outcome"] is None
+
+        review = restarted_client.post(
+            created["review_url"],
+            json={
+                "decision": "approve",
+                "actor": "VP Restart Test",
+                "rationale": "Checkpoint and events recovered from PostgreSQL",
+            },
+        )
+        assert review.status_code == 202
+        completed = _wait_for_api_status(
+            restarted_client,
+            created["run_id"],
+            {"COMPLETED", "FAILED"},
+        )
+        assert completed["status"] == "COMPLETED"
+        assert completed["outcome"] == "PAY"
+        assert completed["thread_id"] == created["thread_id"]
+
+        events = restarted_client.get(created["events_url"]).json()["items"]
+        assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
+        assert events[-1]["event_type"] == "RUN_FINISHED"
+        assert all("phase-one-test-key" not in str(event) for event in events)
