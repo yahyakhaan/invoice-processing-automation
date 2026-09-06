@@ -15,6 +15,12 @@ cp .env.example .env   # optional: set XAI_API_KEY for live LLM runs
 
 Database bootstrap is **idempotent**. `python db/init_db.py` is optional, the first run creates `db/inventory.db` if needed.
 
+For durable PostgreSQL history and checkpoints, set `DATABASE_URL` and a 16, 24,
+or 32-byte `LANGGRAPH_AES_KEY`, then run `python db/init_db.py`. Without
+`DATABASE_URL`, the existing local SQLite behavior is unchanged. See the
+[Phase 1 PostgreSQL guide](docs/deployment/phase-1-postgres.md) for migration and
+integration-test commands.
+
 ## Commands
 
 Pick one path depending on what you want to see.
@@ -86,12 +92,12 @@ pytest -q
 
 Four agents, coordinated by a LangGraph supervisor:
 
-| Stage | Who | What |
-|---|---|---|
-| Ingestion | `DocumentIngestionAgent` | Parsers + OCR normalizers; structured extract for messy txt/pdf |
-| Validation | `ValidationAgent` | Mandatory SQLite/integrity/total/duplicate/fraud tools |
-| Approval | `ApprovalAgent` + independent `ApprovalCriticAgent` | Policy + reflection; critic cannot pay |
-| Payment | `payment_executor` (service) | Idempotent mock payment; never auto-pays ≥ $10k USD |
+| Stage      | Who                                                 | What                                                            |
+| ---------- | --------------------------------------------------- | --------------------------------------------------------------- |
+| Ingestion  | `DocumentIngestionAgent`                            | Parsers + OCR normalizers; structured extract for messy txt/pdf |
+| Validation | `ValidationAgent`                                   | Mandatory SQLite/integrity/total/duplicate/fraud tools          |
+| Approval   | `ApprovalAgent` + independent `ApprovalCriticAgent` | Policy + reflection; critic cannot pay                          |
+| Payment    | `payment_executor` (service)                        | Idempotent mock payment; never auto-pays ≥ $10k USD             |
 
 Normalization, reporting, and VP review are **services**, not agents.
 
@@ -101,25 +107,25 @@ I used LangGraph because this workflow is a control plane, not a conversation. T
 
 ## Dataset as spec
 
-| Invoice | Expected |
-|---|---|
-| INV-1001 | Pay |
-| INV-1002 | Reject `OVER_STOCK` (20× GadgetX > 5) |
-| INV-1003 | Reject fake/zero stock + fraud language + unparseable due date |
-| INV-1004 | Pay |
-| INV-1004 R1 | Pay with `REVISION` (GadgetX 5 ≤ 5) |
-| INV-1005 | Reject over stock (high value does not override) |
-| INV-1006 | Pay (pivoted CSV) |
-| INV-1007 | Reject over stock |
-| INV-1008 | Reject unknown items |
-| INV-1009 | Reject integrity / missing fields |
-| INV-1010 | Pay after aggregating WidgetA 8+4=12 |
-| INV-1011 txt | Pay; PDF in the same batch is `DEDUP` |
-| INV-1012 | Pay with OCR / vendor identity warnings |
-| INV-1013 | Reject over stock + total mismatch |
-| INV-1014 | Pay; EUR converted locally (`FX_REVIEW`) |
-| INV-1015 | Pay |
-| INV-1016 | Reject unknown `WidgetC` |
+| Invoice      | Expected                                                       |
+| ------------ | -------------------------------------------------------------- |
+| INV-1001     | Pay                                                            |
+| INV-1002     | Reject `OVER_STOCK` (20× GadgetX > 5)                          |
+| INV-1003     | Reject fake/zero stock + fraud language + unparseable due date |
+| INV-1004     | Pay                                                            |
+| INV-1004 R1  | Pay with `REVISION` (GadgetX 5 ≤ 5)                            |
+| INV-1005     | Reject over stock (high value does not override)               |
+| INV-1006     | Pay (pivoted CSV)                                              |
+| INV-1007     | Reject over stock                                              |
+| INV-1008     | Reject unknown items                                           |
+| INV-1009     | Reject integrity / missing fields                              |
+| INV-1010     | Pay after aggregating WidgetA 8+4=12                           |
+| INV-1011 txt | Pay; PDF in the same batch is `DEDUP`                          |
+| INV-1012     | Pay with OCR / vendor identity warnings                        |
+| INV-1013     | Reject over stock + total mismatch                             |
+| INV-1014     | Pay; EUR converted locally (`FX_REVIEW`)                       |
+| INV-1015     | Pay                                                            |
+| INV-1016     | Reject unknown `WidgetC`                                       |
 
 Inventory is **read only** during a run so batch order cannot drain stock.
 
