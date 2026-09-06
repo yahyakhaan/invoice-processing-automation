@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -31,6 +32,8 @@ from invoice_agent.schemas import Invoice, InvoiceDraft, ValidationReport
 from invoice_agent.services.normalization import identity_flags, normalize_draft
 from invoice_agent.state import GraphState
 from invoice_agent.tools.payment import execute_payment
+
+EventCallback = Callable[[dict[str, Any]], None]
 
 
 def _annotate_trace(agent_id: str, trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -587,19 +590,52 @@ class InvoicePipeline:
             ]
         }
 
-    def run(self, *, thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _invoke(
+        self,
+        payload: dict[str, Any] | Command,
+        config: dict[str, Any],
+        on_event: EventCallback | None,
+    ) -> None:
+        if on_event is None:
+            self.graph.invoke(payload, config)
+            return
+        for update in self.graph.stream(payload, config, stream_mode="updates"):
+            if not isinstance(update, dict):
+                continue
+            for delta in update.values():
+                if not isinstance(delta, dict):
+                    continue
+                for emitted in delta.get("events") or []:
+                    on_event(emitted)
+
+    def run(
+        self,
+        *,
+        thread_id: str,
+        payload: dict[str, Any],
+        on_event: EventCallback | None = None,
+    ) -> dict[str, Any]:
         config = {"configurable": {"thread_id": thread_id}}
-        self.graph.invoke(payload, config)
+        self._invoke(payload, config, on_event)
         return self.snapshot(thread_id)
 
-    def resume(self, *, thread_id: str, decision: str, actor: str, rationale: str) -> dict[str, Any]:
+    def resume(
+        self,
+        *,
+        thread_id: str,
+        decision: str,
+        actor: str,
+        rationale: str,
+        on_event: EventCallback | None = None,
+    ) -> dict[str, Any]:
         config = {"configurable": {"thread_id": thread_id}}
         snap = self.snapshot(thread_id)
         if snap.get("outcome") in {"PAY", "REJECT", "DEDUP", "INGEST_FAILED", "PAYMENT_FAILED"}:
             return snap
-        self.graph.invoke(
+        self._invoke(
             Command(resume={"decision": decision, "actor": actor, "rationale": rationale}),
             config,
+            on_event,
         )
         return self.snapshot(thread_id)
 
