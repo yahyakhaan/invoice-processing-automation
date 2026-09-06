@@ -23,6 +23,8 @@ integration-test commands.
 
 The [Phase 2 FastAPI guide](docs/deployment/phase-2-fastapi.md) covers uploads,
 bundled samples, durable history, live progress, and VP review over HTTP.
+The [Phase 3 React guide](docs/deployment/phase-3-react-ui.md) covers the
+interactive operations console and frontend development workflow.
 
 ## Commands
 
@@ -98,6 +100,19 @@ PYTHONPATH=src uvicorn invoice_api.app:app --reload
 ```
 
 Open `http://127.0.0.1:8000/docs` for the interactive API documentation.
+
+### 7. React operations console
+
+With FastAPI running on port 8000, start the frontend in a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173` to upload invoices, run bundled samples, follow
+live progress, review high-value invoices, and inspect persistent history.
 
 ## What I did
 
