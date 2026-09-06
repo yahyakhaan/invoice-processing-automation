@@ -7,7 +7,6 @@ from invoice_agent.agents.base import SpecialistAgent, fn_tool
 from invoice_agent.schemas import ApprovalDecision, Invoice, ValidationReport
 from invoice_agent.tools.policy import convert_fx, evaluate_approval_rules, get_policy
 
-
 APPROVE_PROMPT = """You are ApprovalAgent, simulating VP-level commercial judgment.
 You MUST call evaluate_approval_rules, convert_fx, and get_policy.
 Pass invoice_json as the invoice object only, and validation_json as the validation report only.
@@ -24,13 +23,11 @@ class ApprovalAgent(SpecialistAgent):
     output_schema = ApprovalDecision
 
     def build_tools(self):
-        settings_json = self.settings.model_dump_json()
-
         def _fx(invoice_json: str) -> str:
-            return convert_fx(invoice_json, settings_json)
+            return convert_fx(invoice_json, settings=self.settings)
 
         def _rules(invoice_json: str, validation_json: str) -> str:
-            return evaluate_approval_rules(invoice_json, validation_json, settings_json)
+            return evaluate_approval_rules(invoice_json, validation_json, settings=self.settings)
 
         return [
             fn_tool("convert_fx", "Convert invoice total to USD using local FX table", _fx),
