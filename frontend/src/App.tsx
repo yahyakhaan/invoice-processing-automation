@@ -221,11 +221,11 @@ function App() {
         api.samples(),
         api.runs(),
       ]);
-        setHealth(healthResponse);
-        setSamples(sampleResponse);
-        setRuns(runResponse.items);
-        const first = runResponse.items[0];
-        if (first) void selectRun(first.run_id);
+      setHealth(healthResponse);
+      setSamples(sampleResponse);
+      setRuns(runResponse.items);
+      const first = runResponse.items[0];
+      if (first) void selectRun(first.run_id);
     } catch (cause) {
       setHealth(null);
       setError(cause instanceof Error ? cause.message : "Could not connect to the invoice API");
@@ -246,12 +246,20 @@ function App() {
       try {
         const created = await api.createRun(source);
         setEvents([]);
-        const detail = await refreshSelectedRun(created.run_id);
+        const [detail, currentHealth] = await Promise.all([
+          refreshSelectedRun(created.run_id),
+          api.health(),
+        ]);
+        setHealth(currentHealth);
         setRuns((current) => [detail, ...current.filter((item) => item.run_id !== detail.run_id)]);
         connectStream(created.run_id);
         setSelectedFile(null);
         setSelectedSample("");
-        setNotice("Run started. Live workflow events are connected.");
+        setNotice(
+          detail.agentic_mode
+            ? "LLM-powered run started. Live workflow events are connected."
+            : "Deterministic demo run started. Live workflow events are connected.",
+        );
         return created;
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : "Could not start run";
@@ -385,7 +393,7 @@ function App() {
         <section className="intake-panel" aria-labelledby="new-run-title">
           <div className="eyebrow">NEW RUN</div>
           <h1 id="new-run-title">Process an invoice</h1>
-          <p className="muted">Upload a source file or start with a bundled test invoice.</p>
+          <p className="muted">Upload a non-sensitive source file or start with a bundled test invoice.</p>
 
           <input ref={fileInput} className="sr-only" type="file" accept=".pdf,.csv,.json,.xml,.txt" onChange={onFileChange} />
           {selectedFile ? (
@@ -429,6 +437,14 @@ function App() {
             <ShieldCheck size={17} />
             <span><strong>Payment controls stay enforced.</strong> High-value invoices pause for your approval.</span>
           </div>
+          {health && (
+            <div className="local-note">
+              <Activity size={15} />
+              {health.llm_enabled
+                ? `${health.llm_runs_remaining} of ${health.llm_daily_limit} live LLM demo runs remain today. Later runs automatically use deterministic mode.`
+                : "This deployment is using deterministic demo mode; no LLM key is required."}
+            </div>
+          )}
           {health?.database_backend === "sqlite" && (
             <div className="local-note"><RotateCcw size={15} /> Web history lasts for this server session. Use PostgreSQL for restart-safe history.</div>
           )}
