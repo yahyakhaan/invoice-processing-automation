@@ -1,0 +1,59 @@
+name: invoice-automation
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-invoice_automation}
+      POSTGRES_USER: ${POSTGRES_USER:-invoice_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the gitignored .env file}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      target: runtime
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-invoice_app}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-invoice_automation}
+      CHECKPOINT_BACKEND: postgres
+      LANGGRAPH_AES_KEY: ${LANGGRAPH_AES_KEY:?Set LANGGRAPH_AES_KEY in the gitignored .env file}
+      OWNER_ID: ${OWNER_ID:-local}
+      DEMO_LLM_DAILY_LIMIT: ${DEMO_LLM_DAILY_LIMIT:-5}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_MODEL: ${LLM_MODEL:-}
+      REQUIRE_LLM: ${REQUIRE_LLM:-false}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
+      MAX_PDF_PAGES: ${MAX_PDF_PAGES:-25}
+      HIGH_VALUE_USD: ${HIGH_VALUE_USD:-10000}
+      FX_EUR_USD: ${FX_EUR_USD:-1.08}
+      PORT: 8080
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=4)
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 4
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
