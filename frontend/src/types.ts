@@ -4,6 +4,9 @@ export interface HealthResponse {
   status: "ok";
   database_backend: "postgres" | "sqlite";
   provider: string;
+  llm_enabled: boolean;
+  llm_daily_limit: number;
+  llm_runs_remaining: number;
 }
 
 export interface SampleInvoice {
