@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     langgraph_aes_key: str | None = Field(default=None, repr=False, exclude=True)
     output_dir: Path = ROOT / "outputs"
     owner_id: str = "local"
+    demo_llm_daily_limit: int = Field(default=5, ge=0, le=1000)
     max_upload_mb: int = Field(default=10, ge=1)
     max_pdf_pages: int = Field(default=25, ge=1)
     high_value_usd: float = 10000.0

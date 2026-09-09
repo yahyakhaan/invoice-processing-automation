@@ -589,6 +589,25 @@ def list_run_records(
         return records
 
 
+def count_agentic_runs_since(settings: Settings, since: datetime) -> int:
+    """Count persisted public-demo LLM runs for the current owner."""
+    if not settings.database_url:
+        return 0
+    with Session(get_engine(settings.database_url)) as session:
+        return int(
+            session.scalar(
+                select(func.count())
+                .select_from(Run)
+                .where(
+                    Run.owner_id == settings.owner_id,
+                    Run.provider != "mock",
+                    Run.created_at >= since,
+                )
+            )
+            or 0
+        )
+
+
 def append_run_event(settings: Settings, event_payload: dict[str, Any]) -> None:
     if not settings.database_url:
         return
