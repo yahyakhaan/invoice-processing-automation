@@ -15,6 +15,7 @@ from invoice_agent.runner import result_payload
 from invoice_agent.services.demo import hitl_demo_invoice
 from invoice_agent.storage import (
     append_run_event,
+    count_agentic_runs_since,
     create_run_record,
     get_run_record,
     latest_run_event_sequence,
@@ -45,6 +46,7 @@ SENSITIVE_EVENT_KEYS = {
 @dataclass
 class ActiveRun:
     record: dict[str, Any]
+    settings: Settings
     events: list[dict[str, Any]] = field(default_factory=list)
     sequence: int = 0
     busy: bool = False
@@ -97,8 +99,56 @@ class RunService:
         self.settings = settings
         self._active: dict[str, ActiveRun] = {}
         self._lock = RLock()
+        self._budget_day = datetime.now(UTC).date()
+        self._agentic_runs_today = self._persisted_agentic_runs_today()
+
+    def demo_status(self) -> dict[str, Any]:
+        with self._lock:
+            self._refresh_budget_day()
+            enabled = self.settings.agentic_mode and self.settings.demo_llm_daily_limit > 0
+            remaining = (
+                max(0, self.settings.demo_llm_daily_limit - self._agentic_runs_today)
+                if enabled
+                else 0
+            )
+            return {
+                "llm_enabled": enabled,
+                "llm_daily_limit": self.settings.demo_llm_daily_limit,
+                "llm_runs_remaining": remaining,
+            }
+
+    def _persisted_agentic_runs_today(self) -> int:
+        start = datetime.combine(self._budget_day, datetime.min.time(), tzinfo=UTC)
+        return count_agentic_runs_since(self.settings, start)
+
+    def _refresh_budget_day(self) -> None:
+        today = datetime.now(UTC).date()
+        if today != self._budget_day:
+            self._budget_day = today
+            self._agentic_runs_today = self._persisted_agentic_runs_today()
+
+    def _claim_run_settings(self) -> Settings:
+        with self._lock:
+            self._refresh_budget_day()
+            if (
+                self.settings.agentic_mode
+                and self._agentic_runs_today < self.settings.demo_llm_daily_limit
+            ):
+                self._agentic_runs_today += 1
+                return self.settings
+        return self.settings.model_copy(
+            update={"provider_override": "mock", "require_llm": False}
+        )
+
+    def _settings_for_record(self, record: dict[str, Any]) -> Settings:
+        if record.get("agentic_mode"):
+            return self.settings
+        return self.settings.model_copy(
+            update={"provider_override": "mock", "require_llm": False}
+        )
 
     def create(self, source: PreparedSource) -> dict[str, Any]:
+        run_settings = self._claim_run_settings()
         run_id = str(uuid4())
         thread_id = str(uuid4())
         now = _utcnow()
@@ -109,31 +159,40 @@ class RunService:
             "outcome": None,
             "invoice_id": None,
             "source": source.label,
-            "provider": self.settings.provider,
-            "model": self.settings.model_name,
+            "provider": run_settings.provider,
+            "model": run_settings.model_name,
             "created_at": now,
             "updated_at": now,
-            "agentic_mode": self.settings.agentic_mode,
+            "agentic_mode": run_settings.agentic_mode,
         }
         create_run_record(
-            self.settings,
+            run_settings,
             run_id=run_id,
             thread_id=thread_id,
             source=source.label,
         )
         with self._lock:
-            self._active[run_id] = ActiveRun(record=record, busy=True)
+            self._active[run_id] = ActiveRun(
+                record=record,
+                settings=run_settings,
+                busy=True,
+            )
         self._emit(
             run_id,
             event_type="RUN_CREATED",
             message="Invoice run created",
             status="CREATED",
-            data={"source": source.label},
+            data={
+                "source": source.label,
+                "execution_mode": "llm" if run_settings.agentic_mode else "deterministic",
+                "llm_runs_remaining": self.demo_status()["llm_runs_remaining"],
+            },
         )
         return deepcopy(record)
 
     def execute(self, run_id: str, source: PreparedSource) -> None:
         try:
+            run_settings = self._active[run_id].settings
             self._set_status(run_id, "RUNNING")
             self._emit(
                 run_id,
@@ -159,7 +218,7 @@ class RunService:
             def on_event(item: dict[str, Any]) -> None:
                 self._emit_graph_event(run_id, item)
 
-            with capture_progress(on_progress), InvoicePipeline(self.settings) as pipeline:
+            with capture_progress(on_progress), InvoicePipeline(run_settings) as pipeline:
                 if source.demo:
                     invoice = hitl_demo_invoice(thread_id)
                     values = pipeline.run(
@@ -170,6 +229,7 @@ class RunService:
                             raw_path=None,
                             demo=True,
                             invoice=invoice.model_dump(),
+                            run_settings=run_settings,
                         ),
                         on_event=on_event,
                     )
@@ -182,10 +242,11 @@ class RunService:
                             run_id,
                             thread_id,
                             raw_path=str(source.path),
+                            run_settings=run_settings,
                         ),
                         on_event=on_event,
                     )
-            self._finish(run_id, values, source.label)
+            self._finish(run_id, values, source.label, run_settings)
         except Exception as exc:  # noqa: BLE001
             self._fail(run_id, exc)
         finally:
@@ -200,6 +261,7 @@ class RunService:
             if active is None:
                 active = ActiveRun(
                     record=deepcopy(record),
+                    settings=self._settings_for_record(record),
                     sequence=latest_run_event_sequence(self.settings, run_id),
                 )
                 self._active[run_id] = active
@@ -228,6 +290,7 @@ class RunService:
         if record is None:
             return
         try:
+            run_settings = self._settings_for_record(record)
             with capture_progress(
                 lambda message, detail: self._emit(
                     run_id,
@@ -237,7 +300,7 @@ class RunService:
                     stage=_stage_from_progress(message),
                     data={"detail": detail} if detail else {},
                 )
-            ), InvoicePipeline(self.settings) as pipeline:
+            ), InvoicePipeline(run_settings) as pipeline:
                 values = pipeline.resume(
                     thread_id=record["thread_id"],
                     decision=decision,
@@ -245,7 +308,7 @@ class RunService:
                     rationale=rationale,
                     on_event=lambda item: self._emit_graph_event(run_id, item),
                 )
-            self._finish(run_id, values, record.get("source"))
+            self._finish(run_id, values, record.get("source"), run_settings)
         except Exception as exc:  # noqa: BLE001
             self._fail(run_id, exc)
 
@@ -280,6 +343,7 @@ class RunService:
         run_id: str,
         thread_id: str,
         *,
+        run_settings: Settings,
         raw_path: str | None,
         demo: bool = False,
         invoice: dict[str, Any] | None = None,
@@ -296,16 +360,22 @@ class RunService:
             "ingest_retry_count": 0,
             "validation_retry_count": 0,
             "approval_revision_count": 0,
-            "agentic_mode": self.settings.agentic_mode,
+            "agentic_mode": run_settings.agentic_mode,
             "run_id": run_id,
             "thread_id": thread_id,
-            "provider": self.settings.provider,
-            "model": self.settings.model_name,
+            "provider": run_settings.provider,
+            "model": run_settings.model_name,
             "model_calls": 0,
         }
 
-    def _finish(self, run_id: str, values: dict[str, Any], source: str | None) -> None:
-        payload = result_payload(values, self.settings, source)
+    def _finish(
+        self,
+        run_id: str,
+        values: dict[str, Any],
+        source: str | None,
+        run_settings: Settings,
+    ) -> None:
+        payload = result_payload(values, run_settings, source)
         status = _status_for_outcome(payload.get("outcome"))
         public_outcome = _public_outcome(status, payload.get("outcome"))
         event_type = "RUN_PENDING_REVIEW" if status == "PENDING_REVIEW" else "RUN_FINISHED"

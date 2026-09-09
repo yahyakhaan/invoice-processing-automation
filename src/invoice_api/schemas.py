@@ -13,6 +13,9 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     database_backend: Literal["postgres", "sqlite"]
     provider: str
+    llm_enabled: bool
+    llm_daily_limit: int
+    llm_runs_remaining: int
 
 
 class SampleInvoice(BaseModel):
