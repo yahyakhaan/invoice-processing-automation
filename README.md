@@ -17,14 +17,7 @@ Database bootstrap is **idempotent**. `python db/init_db.py` is optional, the fi
 
 For durable PostgreSQL history and checkpoints, set `DATABASE_URL` and a 16, 24,
 or 32-byte `LANGGRAPH_AES_KEY`, then run `python db/init_db.py`. Without
-`DATABASE_URL`, the existing local SQLite behavior is unchanged. See the
-[Phase 1 PostgreSQL guide](docs/deployment/phase-1-postgres.md) for migration and
-integration-test commands.
-
-The [Phase 2 FastAPI guide](docs/deployment/phase-2-fastapi.md) covers uploads,
-bundled samples, durable history, live progress, and VP review over HTTP.
-The [Phase 3 React guide](docs/deployment/phase-3-react-ui.md) covers the
-interactive operations console and frontend development workflow.
+`DATABASE_URL`, the existing local SQLite behavior is unchanged.
 
 ## Commands
 
@@ -114,6 +107,25 @@ npm run dev
 Open `http://127.0.0.1:5173` to upload invoices, run bundled samples, follow
 live progress, review high-value invoices, and inspect persistent history.
 
+### 8. Docker Compose production-like stack
+
+After setting `POSTGRES_PASSWORD` and `LANGGRAPH_AES_KEY` in the gitignored
+`.env` file, build and start the complete application with:
+
+```bash
+docker compose up --build
+```
+
+Open `http://127.0.0.1:8000`. Migrations and seed data are applied
+idempotently before FastAPI starts, and PostgreSQL history is kept in a named
+volume across application-container rebuilds.
+
+For the public portfolio demo, set `DEMO_LLM_DAILY_LIMIT=5`. The first five
+runs each UTC day use the configured hosted LLM; later runs automatically use
+the deterministic pipeline. Keep provider credentials in the gitignored `.env`
+file locally; production secret-manager wiring is part of the cloud deployment
+phase.
+
 ## What I did
 
 Four agents, coordinated by a LangGraph supervisor:
@@ -170,4 +182,7 @@ Each run writes `outputs/<run_id>/<stem>/result.json` and `events.jsonl` with `a
 
 ## What I cut
 
-No live bank, email inbox, cloud deploy, stock reservation, CrewAI, or production SSO. VP review is a local checkpoint (CLI or Streamlit).
+No live bank, email inbox, cloud deploy, stock reservation, CrewAI, user
+accounts, or production authorization. The public portfolio UI uses mock
+payments, and VP review resumes the same durable checkpoint through the CLI,
+Streamlit, or React console.
