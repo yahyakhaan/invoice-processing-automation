@@ -7,7 +7,8 @@ from fastapi.testclient import TestClient
 from fpdf import FPDF
 
 from invoice_api.app import create_app
-from invoice_api.service import sanitize_event_data
+from invoice_api.service import RunService, sanitize_event_data
+from invoice_api.sources import PreparedSource
 
 
 def wait_for_status(
@@ -55,6 +56,9 @@ def test_health_and_sample_catalog_do_not_expose_secrets(settings) -> None:
             "status": "ok",
             "database_backend": "sqlite",
             "provider": "mock",
+            "llm_enabled": False,
+            "llm_daily_limit": 5,
+            "llm_runs_remaining": 0,
         }
         assert "must-not-appear" not in health.text
 
@@ -68,6 +72,44 @@ def test_health_and_sample_catalog_do_not_expose_secrets(settings) -> None:
         assert content.status_code == 200
         assert "INV-1001" in content.text
         assert client.get("/api/samples/..%2Fseed_inventory.sql/content").status_code == 404
+
+
+def test_public_demo_falls_back_after_daily_llm_allowance(settings) -> None:
+    live_settings = settings.model_copy(
+        update={
+            "provider_override": "groq",
+            "llm_provider": "groq",
+            "groq_api_key": "test-only-key",
+            "demo_llm_daily_limit": 2,
+        }
+    )
+    service = RunService(live_settings)
+    source = PreparedSource(path=None, label="demo:quota", demo=True)
+
+    records = [service.create(source) for _ in range(3)]
+
+    assert [record["agentic_mode"] for record in records] == [True, True, False]
+    assert [record["provider"] for record in records] == ["groq", "groq", "mock"]
+    assert service.demo_status() == {
+        "llm_enabled": True,
+        "llm_daily_limit": 2,
+        "llm_runs_remaining": 0,
+    }
+
+
+def test_compiled_frontend_is_served_without_shadowing_api(settings, tmp_path) -> None:
+    frontend_dist = tmp_path / "frontend-dist"
+    frontend_dist.mkdir()
+    (frontend_dist / "index.html").write_text(
+        "<!doctype html><title>Container UI</title>",
+        encoding="utf-8",
+    )
+
+    with TestClient(create_app(settings, frontend_dist=frontend_dist)) as client:
+        root = client.get("/")
+        assert root.status_code == 200
+        assert "Container UI" in root.text
+        assert client.get("/api/health").status_code == 200
 
 
 def test_sample_run_history_events_stream_and_artifact(settings) -> None:

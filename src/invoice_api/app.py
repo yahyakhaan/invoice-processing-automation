@@ -4,6 +4,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
@@ -19,6 +20,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from invoice_agent.config import Settings, get_settings
 from invoice_agent.storage import ensure_database
@@ -44,7 +46,11 @@ from invoice_api.sources import (
 STREAM_END_STATUSES = TERMINAL_STATUSES | {"PENDING_REVIEW"}
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    frontend_dist: Path | None = None,
+) -> FastAPI:
     resolved_settings = settings or get_settings()
     catalog = SampleCatalog()
 
@@ -60,7 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application = FastAPI(
         title="Acme Invoice Automation API",
-        version="0.2.0",
+        version="0.5.0",
         lifespan=lifespan,
     )
 
@@ -79,10 +85,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return record
 
     @application.get("/api/health", response_model=HealthResponse, tags=["system"])
-    def health() -> HealthResponse:
+    def health(request: Request) -> HealthResponse:
+        demo_status = service(request).demo_status()
         return HealthResponse(
             database_backend="postgres" if resolved_settings.database_url else "sqlite",
             provider=resolved_settings.provider,
+            **demo_status,
         )
 
     @application.get("/api/samples", response_model=list[SampleInvoice], tags=["samples"])
@@ -90,7 +98,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return catalog.list()
 
     @application.get("/api/samples/{sample_id}/content", tags=["samples"])
-    def sample_content(sample_id: str) -> FileResponse:
+    def sample_content(
+        sample_id: str,
+    ) -> FileResponse:
         try:
             source = catalog.resolve(sample_id)
             content_type = catalog.content_type(sample_id)
@@ -152,7 +162,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return RunList(items=[RunSummary.model_validate(item) for item in items])
 
     @application.get("/api/runs/{run_id}", response_model=RunDetail, tags=["runs"])
-    def run_detail(request: Request, run_id: UUID) -> RunDetail:
+    def run_detail(
+        request: Request,
+        run_id: UUID,
+    ) -> RunDetail:
         return RunDetail.model_validate(get_record_or_404(service(request), run_id))
 
     @application.get("/api/runs/{run_id}/events", response_model=EventList, tags=["events"])
@@ -258,7 +271,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @application.get("/api/runs/{run_id}/artifact", tags=["runs"])
-    def audit_artifact(request: Request, run_id: UUID) -> Response:
+    def audit_artifact(
+        request: Request,
+        run_id: UUID,
+    ) -> Response:
         record = get_record_or_404(service(request), run_id)
         if record["status"] not in TERMINAL_STATUSES:
             raise HTTPException(status_code=409, detail="Audit artifact is available after completion")
@@ -267,6 +283,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content=body,
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="run-{run_id}.json"'},
+        )
+
+    static_directory = (
+        frontend_dist or Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    )
+    if static_directory.is_dir():
+        application.mount(
+            "/",
+            StaticFiles(directory=static_directory, html=True),
+            name="frontend",
         )
 
     return application

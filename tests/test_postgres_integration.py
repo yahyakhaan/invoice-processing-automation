@@ -21,6 +21,8 @@ from invoice_agent.storage import (
     record_processed,
 )
 from invoice_api.app import create_app
+from invoice_api.service import RunService
+from invoice_api.sources import PreparedSource
 
 pytestmark = pytest.mark.postgres
 
@@ -221,3 +223,26 @@ def test_api_history_events_and_review_survive_app_restart(postgres_settings) ->
         assert [event["sequence"] for event in events] == list(range(1, len(events) + 1))
         assert events[-1]["event_type"] == "RUN_FINISHED"
         assert all("phase-one-test-key" not in str(event) for event in events)
+
+
+def test_public_demo_llm_allowance_survives_app_restart(postgres_settings) -> None:
+    live_settings = postgres_settings.model_copy(
+        update={
+            "owner_id": "phase-five-quota-integration-test",
+            "provider_override": "groq",
+            "llm_provider": "groq",
+            "groq_api_key": "test-only-key",
+            "demo_llm_daily_limit": 2,
+        }
+    )
+    source = PreparedSource(path=None, label="demo:quota", demo=True)
+
+    first_service = RunService(live_settings)
+    assert first_service.create(source)["agentic_mode"] is True
+
+    restarted_service = RunService(live_settings)
+    assert restarted_service.demo_status()["llm_runs_remaining"] == 1
+    assert restarted_service.create(source)["agentic_mode"] is True
+    fallback = restarted_service.create(source)
+    assert fallback["agentic_mode"] is False
+    assert fallback["provider"] == "mock"
